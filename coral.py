@@ -2,11 +2,12 @@
 
 import json
 import rados
-from pprint import pprint
 
 def main():
     cluster_info = get_cluster_info()
-    pprint(cluster_info)
+
+    calculate_usage(cluster_info)
+    display_usage(cluster_info)
 
 def get_cluster_info():
     # Connect to the cluster
@@ -115,6 +116,59 @@ def get_crush_rules(cluster):
         }
 
     return crush_rules
+
+# Loop through each pg in a pool and add the appropriate amount to each OSD
+def calculate_usage(cluster_info):
+    # Initialize current/future usage for every OSD in the cluster
+    for osd in cluster_info['osds']:
+        cluster_info['osds'][osd]['current_usage'] = 0
+        cluster_info['osds'][osd]['current_pgs'] = 0
+        cluster_info['osds'][osd]['future_usage'] = 0
+        cluster_info['osds'][osd]['future_pgs'] = 0
+
+    for pool in cluster_info['pools']:
+        for pg in cluster_info['pgs']:
+            if not pg.startswith(f"{pool}."):
+                continue
+
+            # Calculate current usage
+            for osd in cluster_info['pgs'][pg]['acting']:
+                cluster_info['osds'][osd]['current_usage'] += cluster_info['pgs'][pg]['num_bytes']
+                cluster_info['osds'][osd]['current_pgs'] += 1
+
+            # Calculate future usage
+            for osd in cluster_info['pgs'][pg]['up']:
+                cluster_info['osds'][osd]['future_usage'] += cluster_info['pgs'][pg]['num_bytes']
+                cluster_info['osds'][osd]['future_pgs'] += 1
+
+def display_usage(cluster_info):
+    # Calculate data per OSD after backfilling is complete
+    print("OSD  | Class | Weight  | Size        | Current Usage             | Future Usage              | Change")
+    print("-----+-------+---------+-------------+---------------------------+---------------------------+---------------------------")
+
+    for osd in cluster_info['osds']:
+        device_class = cluster_info['osds'][osd]['device_class']
+        crush_weight = cluster_info['osds'][osd]['crush_weight']
+        drive_size = cluster_info['osds'][osd]['size'] / 1024**3
+
+        current_usage_gb = cluster_info['osds'][osd]['current_usage'] / 1024**3
+        current_pgs = cluster_info['osds'][osd]['current_pgs']
+
+        future_usage_gb = cluster_info['osds'][osd]['future_usage'] / 1024**3
+        future_pgs = cluster_info['osds'][osd]['future_pgs']
+
+        if drive_size != 0:
+            current_usage_pct = 100*(current_usage_gb / drive_size)
+            future_usage_pct = 100*(future_usage_gb / drive_size)
+        else:
+            current_usage_pct = 0
+            future_usage_pct = 0
+
+        change_usage_gb = future_usage_gb - current_usage_gb
+        change_usage_pct = future_usage_pct - current_usage_pct
+        change_pgs = future_pgs - current_pgs
+
+        print(f"{osd:<4} | {device_class:<5} | {crush_weight:0.5f} | {drive_size:>7.1f} GiB | {current_usage_gb:>5.1f} GiB  {current_usage_pct:4.1f}%  {current_pgs:>3} PGs | {future_usage_gb:>5.1f} GiB  {future_usage_pct:4.1f}%  {future_pgs:>3} PGs | {change_usage_gb:+5.1f} GiB  {change_usage_pct:+5.1f}%  {change_pgs:+3} PGs")
 
 if __name__ == '__main__':
     main()
