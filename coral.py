@@ -3,6 +3,13 @@
 import json
 import rados
 
+BLUE = '\033[1;34m'
+CYAN = '\033[1;36m'
+GREEN = '\033[1;32m'
+RED = '\033[1;31m'
+YELLOW = '\033[1;33m'
+RESET = '\033[0m'
+
 def main():
     cluster_info = get_cluster_info()
 
@@ -168,7 +175,34 @@ def display_usage(cluster_info):
         change_usage_pct = future_usage_pct - current_usage_pct
         change_pgs = future_pgs - current_pgs
 
-        print(f"{osd:<4} | {device_class:<5} | {crush_weight:0.5f} | {drive_size:>7.1f} GiB | {current_usage_gb:>5.1f} GiB  {current_usage_pct:4.1f}%  {current_pgs:>3} PGs | {future_usage_gb:>5.1f} GiB  {future_usage_pct:4.1f}%  {future_pgs:>3} PGs | {change_usage_gb:+5.1f} GiB  {change_usage_pct:+5.1f}%  {change_pgs:+3} PGs")
+        osd_stat_strings = []
+        osd_stat_strings.append(f"{osd:<4}")
+        osd_stat_strings.append(f"{device_class:<5}")
+        osd_stat_strings.append(f"{crush_weight:0.5f}")
+        osd_stat_strings.append(f"{drive_size:>7.1f} GiB")
+
+        if current_usage_pct > 90:
+            PCT_COLOR = RED
+        elif current_usage_pct > 80:
+            PCT_COLOR = YELLOW
+        elif current_usage_pct > 0:
+            PCT_COLOR = GREEN
+        else:
+            PCT_COLOR = BLUE
+        osd_stat_strings.append(f"{current_usage_gb:>5.1f} GiB  {PCT_COLOR}{current_usage_pct:4.1f}%{RESET}  {current_pgs:>3} PGs")
+
+        if future_usage_pct > 90:
+            PCT_COLOR = RED
+        elif future_usage_pct > 80:
+            PCT_COLOR = YELLOW
+        elif future_usage_pct > 0:
+            PCT_COLOR = GREEN
+        else:
+            PCT_COLOR = BLUE
+        osd_stat_strings.append(f"{future_usage_gb:>5.1f} GiB  {PCT_COLOR}{future_usage_pct:4.1f}%{RESET}  {future_pgs:>3} PGs")
+        osd_stat_strings.append(f"{change_usage_gb:+5.1f} GiB  {change_usage_pct:+5.1f}%  {change_pgs:+3} PGs")
+
+        print(" | ".join(osd_stat_strings))
 
 if __name__ == '__main__':
     main()
