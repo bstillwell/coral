@@ -150,8 +150,8 @@ def calculate_usage(cluster_info):
 
 def display_usage(cluster_info):
     # Calculate data per OSD after backfilling is complete
-    print("OSD  | Class | Weight  | Size        | Current Usage             | Future Usage              | Change")
-    print("-----+-------+---------+-------------+---------------------------+---------------------------+---------------------------")
+    print("OSD  | Class | Weight   | Size        | Current Usage             | Future Usage              | Change")
+    print("-----+-------+----------+-------------+---------------------------+---------------------------+---------------------------")
 
     for osd in cluster_info['osds']:
         device_class = cluster_info['osds'][osd]['device_class']
@@ -178,7 +178,7 @@ def display_usage(cluster_info):
         osd_stat_strings = []
         osd_stat_strings.append(f"{osd:<4}")
         osd_stat_strings.append(f"{device_class:<5}")
-        osd_stat_strings.append(f"{crush_weight:0.5f}")
+        osd_stat_strings.append(f"{crush_weight:>8.5f}")
         osd_stat_strings.append(f"{drive_size:>7.1f} GiB")
 
         if current_usage_pct > 90:
