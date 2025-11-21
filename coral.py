@@ -3,11 +3,12 @@
 import json
 import rados
 
-BLUE = '\033[1;34m'
-CYAN = '\033[1;36m'
-GREEN = '\033[1;32m'
-RED = '\033[1;31m'
-YELLOW = '\033[1;33m'
+BLUE = '\033[0;34m'
+CYAN = '\033[0;36m'
+GREEN = '\033[0;32m'
+RED = '\033[0;31m'
+L_RED = '\033[1;31m'
+YELLOW = '\033[0;33m'
 RESET = '\033[0m'
 
 def main():
@@ -150,8 +151,8 @@ def calculate_usage(cluster_info):
 
 def display_usage(cluster_info):
     # Calculate data per OSD after backfilling is complete
-    print("OSD  | Class | Weight   | Size        | Current Usage             | Future Usage              | Change")
-    print("-----+-------+----------+-------------+---------------------------+---------------------------+---------------------------")
+    print("OSD  | Class | Weight   | Size        | Current Usage              | Future Usage               | Change")
+    print("-----+-------+----------+-------------+----------------------------+----------------------------+----------------------------")
 
     for osd in cluster_info['osds']:
         device_class = cluster_info['osds'][osd]['device_class']
@@ -181,7 +182,9 @@ def display_usage(cluster_info):
         osd_stat_strings.append(f"{crush_weight:>8.5f}")
         osd_stat_strings.append(f"{drive_size:>7.1f} GiB")
 
-        if current_usage_pct > 90:
+        if current_usage_pct > 100:
+            PCT_COLOR = L_RED
+        elif current_usage_pct > 90:
             PCT_COLOR = RED
         elif current_usage_pct > 80:
             PCT_COLOR = YELLOW
@@ -189,9 +192,11 @@ def display_usage(cluster_info):
             PCT_COLOR = GREEN
         else:
             PCT_COLOR = BLUE
-        osd_stat_strings.append(f"{current_usage_gb:>5.1f} GiB  {PCT_COLOR}{current_usage_pct:4.1f}%{RESET}  {current_pgs:>3} PGs")
+        osd_stat_strings.append(f"{current_usage_gb:>5.1f} GiB  {PCT_COLOR}{current_usage_pct:5.1f}%{RESET}  {current_pgs:>3} PGs")
 
-        if future_usage_pct > 90:
+        if future_usage_pct > 100:
+            PCT_COLOR = L_RED
+        elif future_usage_pct > 90:
             PCT_COLOR = RED
         elif future_usage_pct > 80:
             PCT_COLOR = YELLOW
@@ -199,8 +204,8 @@ def display_usage(cluster_info):
             PCT_COLOR = GREEN
         else:
             PCT_COLOR = BLUE
-        osd_stat_strings.append(f"{future_usage_gb:>5.1f} GiB  {PCT_COLOR}{future_usage_pct:4.1f}%{RESET}  {future_pgs:>3} PGs")
-        osd_stat_strings.append(f"{change_usage_gb:+5.1f} GiB  {change_usage_pct:+5.1f}%  {change_pgs:+3} PGs")
+        osd_stat_strings.append(f"{future_usage_gb:>5.1f} GiB  {PCT_COLOR}{future_usage_pct:5.1f}%{RESET}  {future_pgs:>3} PGs")
+        osd_stat_strings.append(f"{change_usage_gb:+5.1f} GiB  {change_usage_pct:+6.1f}%  {change_pgs:+3} PGs")
 
         print(" | ".join(osd_stat_strings))
 
