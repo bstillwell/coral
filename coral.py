@@ -155,6 +155,10 @@ def calculate_usage(cluster_info):
 
             # Calculate current usage
             for osd in cluster_info['pgs'][pg]['acting']:
+                # Skip non-existent OSDs
+                if osd == 2147483647:
+                    continue
+
                 if replica:
                     cluster_info['osds'][osd]['current_usage'] += cluster_info['pgs'][pg]['num_bytes']
                 else:
@@ -163,6 +167,10 @@ def calculate_usage(cluster_info):
 
             # Calculate future usage
             for osd in cluster_info['pgs'][pg]['up']:
+                # Skip non-existent OSDs
+                if osd == 2147483647:
+                    continue
+
                 if replica:
                     cluster_info['osds'][osd]['future_usage'] += cluster_info['pgs'][pg]['num_bytes']
                 else:
