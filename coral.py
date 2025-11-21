@@ -108,6 +108,15 @@ def get_pool_info(cluster):
             'size': pool['size']
         }
 
+        # For erasure coded pools we need to grab the k/m from each profile
+        if POOL_TYPE_NAMES[pool['type']] == 'erasure':
+            cmd = {'prefix': 'osd erasure-code-profile get', 'name': pool['erasure_code_profile'], 'format': 'json'}
+            ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
+            ec_profile = json.loads(output.decode('utf-8'))
+
+            pool_info[pool['pool_id']]['k'] = int(ec_profile['k'])
+            pool_info[pool['pool_id']]['m'] = int(ec_profile['m'])
+
     return pool_info
 
 def get_crush_rules(cluster):
@@ -135,18 +144,29 @@ def calculate_usage(cluster_info):
         cluster_info['osds'][osd]['future_pgs'] = 0
 
     for pool in cluster_info['pools']:
+        if cluster_info['pools'][pool]['type'] == 'replica':
+            replica = True
+        else:
+            replica = False
+
         for pg in cluster_info['pgs']:
             if not pg.startswith(f"{pool}."):
                 continue
 
             # Calculate current usage
             for osd in cluster_info['pgs'][pg]['acting']:
-                cluster_info['osds'][osd]['current_usage'] += cluster_info['pgs'][pg]['num_bytes']
+                if replica:
+                    cluster_info['osds'][osd]['current_usage'] += cluster_info['pgs'][pg]['num_bytes']
+                else:
+                    cluster_info['osds'][osd]['current_usage'] += cluster_info['pgs'][pg]['num_bytes'] / cluster_info['pools'][pool]['k']
                 cluster_info['osds'][osd]['current_pgs'] += 1
 
             # Calculate future usage
             for osd in cluster_info['pgs'][pg]['up']:
-                cluster_info['osds'][osd]['future_usage'] += cluster_info['pgs'][pg]['num_bytes']
+                if replica:
+                    cluster_info['osds'][osd]['future_usage'] += cluster_info['pgs'][pg]['num_bytes']
+                else:
+                    cluster_info['osds'][osd]['future_usage'] += cluster_info['pgs'][pg]['num_bytes'] / cluster_info['pools'][pool]['k']
                 cluster_info['osds'][osd]['future_pgs'] += 1
 
 def display_usage(cluster_info):
