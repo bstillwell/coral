@@ -12,28 +12,28 @@ YELLOW = '\033[0;33m'
 RESET = '\033[0m'
 
 def main():
-    cluster_info = get_cluster_info()
+    cluster_state = get_cluster_state()
 
-    calculate_usage(cluster_info)
-    display_usage(cluster_info)
+    calculate_usage(cluster_state)
+    display_usage(cluster_state)
 
-def get_cluster_info():
+def get_cluster_state():
     # Connect to the cluster
     cluster = rados.Rados(conffile="/etc/ceph/ceph.conf")
     cluster.connect()
 
     # Gather the data we need
-    cluster_info = {}
-    cluster_info['osds'] = get_osd_info(cluster)
-    cluster_info['pgs'] = get_pg_info(cluster)
-    cluster_info['pools'] = get_pool_info(cluster)
-    cluster_info['crush_rules'] = get_crush_rules(cluster)
+    cluster_state = {}
+    cluster_state['osds'] = get_osd_info(cluster)
+    cluster_state['pgs'] = get_pg_info(cluster)
+    cluster_state['pools'] = get_pool_info(cluster)
+    cluster_state['crush_rules'] = get_crush_rules(cluster)
 
     # Disconnect from the cluster
     cluster.shutdown()
 
     # Return the cluster information
-    return cluster_info
+    return cluster_state
 
 def get_osd_info(cluster):
     osd_info = {}
@@ -135,63 +135,63 @@ def get_crush_rules(cluster):
     return crush_rules
 
 # Loop through each pg in a pool and add the appropriate amount to each OSD
-def calculate_usage(cluster_info):
+def calculate_usage(cluster_state):
     # Initialize current/future usage for every OSD in the cluster
-    for osd in cluster_info['osds']:
-        cluster_info['osds'][osd]['current_usage'] = 0
-        cluster_info['osds'][osd]['current_pgs'] = 0
-        cluster_info['osds'][osd]['future_usage'] = 0
-        cluster_info['osds'][osd]['future_pgs'] = 0
+    for osd in cluster_state['osds']:
+        cluster_state['osds'][osd]['current_usage'] = 0
+        cluster_state['osds'][osd]['current_pgs'] = 0
+        cluster_state['osds'][osd]['future_usage'] = 0
+        cluster_state['osds'][osd]['future_pgs'] = 0
 
-    for pool in cluster_info['pools']:
-        if cluster_info['pools'][pool]['type'] == 'replica':
+    for pool in cluster_state['pools']:
+        if cluster_state['pools'][pool]['type'] == 'replica':
             replica = True
         else:
             replica = False
 
-        for pg in cluster_info['pgs']:
+        for pg in cluster_state['pgs']:
             if not pg.startswith(f"{pool}."):
                 continue
 
             # Calculate current usage
-            for osd in cluster_info['pgs'][pg]['acting']:
+            for osd in cluster_state['pgs'][pg]['acting']:
                 # Skip non-existent OSDs
                 if osd == 2147483647:
                     continue
 
                 if replica:
-                    cluster_info['osds'][osd]['current_usage'] += cluster_info['pgs'][pg]['num_bytes']
+                    cluster_state['osds'][osd]['current_usage'] += cluster_state['pgs'][pg]['num_bytes']
                 else:
-                    cluster_info['osds'][osd]['current_usage'] += cluster_info['pgs'][pg]['num_bytes'] / cluster_info['pools'][pool]['k']
-                cluster_info['osds'][osd]['current_pgs'] += 1
+                    cluster_state['osds'][osd]['current_usage'] += cluster_state['pgs'][pg]['num_bytes'] / cluster_state['pools'][pool]['k']
+                cluster_state['osds'][osd]['current_pgs'] += 1
 
             # Calculate future usage
-            for osd in cluster_info['pgs'][pg]['up']:
+            for osd in cluster_state['pgs'][pg]['up']:
                 # Skip non-existent OSDs
                 if osd == 2147483647:
                     continue
 
                 if replica:
-                    cluster_info['osds'][osd]['future_usage'] += cluster_info['pgs'][pg]['num_bytes']
+                    cluster_state['osds'][osd]['future_usage'] += cluster_state['pgs'][pg]['num_bytes']
                 else:
-                    cluster_info['osds'][osd]['future_usage'] += cluster_info['pgs'][pg]['num_bytes'] / cluster_info['pools'][pool]['k']
-                cluster_info['osds'][osd]['future_pgs'] += 1
+                    cluster_state['osds'][osd]['future_usage'] += cluster_state['pgs'][pg]['num_bytes'] / cluster_state['pools'][pool]['k']
+                cluster_state['osds'][osd]['future_pgs'] += 1
 
-def display_usage(cluster_info):
+def display_usage(cluster_state):
     # Calculate data per OSD after backfilling is complete
     print("OSD  | Class | Weight   | Size        | Current Usage              | Future Usage               | Change")
     print("-----+-------+----------+-------------+----------------------------+----------------------------+----------------------------")
 
-    for osd in cluster_info['osds']:
-        device_class = cluster_info['osds'][osd]['device_class']
-        crush_weight = cluster_info['osds'][osd]['crush_weight']
-        drive_size = cluster_info['osds'][osd]['size'] / 1024**3
+    for osd in cluster_state['osds']:
+        device_class = cluster_state['osds'][osd]['device_class']
+        crush_weight = cluster_state['osds'][osd]['crush_weight']
+        drive_size = cluster_state['osds'][osd]['size'] / 1024**3
 
-        current_usage_gb = cluster_info['osds'][osd]['current_usage'] / 1024**3
-        current_pgs = cluster_info['osds'][osd]['current_pgs']
+        current_usage_gb = cluster_state['osds'][osd]['current_usage'] / 1024**3
+        current_pgs = cluster_state['osds'][osd]['current_pgs']
 
-        future_usage_gb = cluster_info['osds'][osd]['future_usage'] / 1024**3
-        future_pgs = cluster_info['osds'][osd]['future_pgs']
+        future_usage_gb = cluster_state['osds'][osd]['future_usage'] / 1024**3
+        future_pgs = cluster_state['osds'][osd]['future_pgs']
 
         if drive_size != 0:
             current_usage_pct = 100*(current_usage_gb / drive_size)
