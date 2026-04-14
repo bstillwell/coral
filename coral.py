@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import json
+import logging
 import rados
+import sys
 
 BLUE = '\033[0;34m'
 CYAN = '\033[0;36m'
@@ -12,31 +14,62 @@ YELLOW = '\033[0;33m'
 RESET = '\033[0m'
 
 def main():
-    cluster_state = get_cluster_state()
+    logger = setup_logging("/var/log/ceph/coral.log")
+    logger.info("Initializing Coral Balancer")
 
-    calculate_usage(cluster_state)
+    cluster_state = get_cluster_state(logger)
+
+    calculate_usage(cluster_state, logger)
     display_usage(cluster_state)
 
-def get_cluster_state():
+def setup_logging(log_file):
+    logger = logging.getLogger('Coral')
+    logger.setLevel(logging.DEBUG)
+
+    if not logger.handlers:
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+        # File handler
+        try:
+            fh = logging.FileHandler(log_file)
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(formatter)
+            logger.addHandler(fh)
+        except PermissionError:
+            print(f"{YELLOW}Warning: Could not open {log_file} for writing.  File logging disabled.{RESET}")
+
+        # Console handler
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+
+    return logger
+
+def get_cluster_state(logger):
     # Connect to the cluster
+    logger.debug("Connecting to Ceph cluster")
     cluster = rados.Rados(conffile="/etc/ceph/ceph.conf")
     cluster.connect()
 
     # Gather the data we need
     cluster_state = {}
-    cluster_state['osds'] = get_osd_info(cluster)
-    cluster_state['pgs'] = get_pg_info(cluster)
-    cluster_state['pools'] = get_pool_info(cluster)
-    cluster_state['crush_rules'] = get_crush_rules(cluster)
+    cluster_state['osds'] = get_osd_info(cluster, logger)
+    cluster_state['pgs'] = get_pg_info(cluster, logger)
+    cluster_state['pools'] = get_pool_info(cluster, logger)
+    cluster_state['crush_rules'] = get_crush_rules(cluster, logger)
 
     # Disconnect from the cluster
+    logger.debug("Disconnecting from Ceph cluster")
     cluster.shutdown()
 
     # Return the cluster information
     return cluster_state
 
-def get_osd_info(cluster):
+def get_osd_info(cluster, logger):
     osd_info = {}
+
+    logger.debug("Gathering info for OSDs")
 
     # Get the up/in status from 'osd dump'
     cmd = {'prefix': 'osd dump', 'format': 'json'}
@@ -62,7 +95,9 @@ def get_osd_info(cluster):
 
     return osd_info
 
-def get_pg_info(cluster):
+def get_pg_info(cluster, logger):
+    logger.debug("Gathering info for PGs")
+
     # Grab the up/acting sets, state, and size for each PG
     cmd = {'prefix': 'pg dump', 'format': 'json'}
     ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
@@ -90,8 +125,10 @@ def get_pg_info(cluster):
 
     return pg_info
 
-def get_pool_info(cluster):
+def get_pool_info(cluster, logger):
     POOL_TYPE_NAMES = {1: 'replica', 3: 'erasure'}
+
+    logger.debug("Gathering info for pools")
 
     # Grab name, type (replica/erasure) pg count, crush rule, and size (replica count/erase coding shards) for each pool
     cmd = {'prefix': 'osd pool ls', 'detail': 'detail', 'format': 'json'}
@@ -119,7 +156,9 @@ def get_pool_info(cluster):
 
     return pool_info
 
-def get_crush_rules(cluster):
+def get_crush_rules(cluster, logger):
+    logger.debug("Gathering CRUSH rules")
+
     # Grab all the CRUSH rules
     cmd = {'prefix': 'osd crush rule dump', 'format': 'json'}
     ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
@@ -135,7 +174,9 @@ def get_crush_rules(cluster):
     return crush_rules
 
 # Loop through each pg in a pool and add the appropriate amount to each OSD
-def calculate_usage(cluster_state):
+def calculate_usage(cluster_state, logger):
+    logger.debug("Calculating current and future usage for each OSD")
+
     # Initialize current/future usage for every OSD in the cluster
     for osd in cluster_state['osds']:
         cluster_state['osds'][osd]['current_usage'] = 0
