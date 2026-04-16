@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import json
 import logging
 import rados
@@ -14,7 +15,11 @@ YELLOW = '\033[0;33m'
 RESET = '\033[0m'
 
 def main():
-    logger = setup_logging("/var/log/ceph/coral.log")
+    parser = argparse.ArgumentParser(description="Coral (Clyso Optimized RebALancer)")
+    parser.add_argument('--preview', action='store_true', help="Show the future cluster state")
+    args = parser.parse_args()
+
+    logger = setup_logging("/var/log/ceph/coral.log", is_preview=args.preview)
     logger.info("Initializing Coral Balancer")
 
     cluster_state = get_cluster_state(logger)
@@ -22,11 +27,16 @@ def main():
     calculate_usage(cluster_state, logger)
     display_usage(cluster_state)
 
-def setup_logging(log_file):
+def setup_logging(log_file, is_preview=False):
     logger = logging.getLogger('Coral')
     logger.setLevel(logging.DEBUG)
 
     if not logger.handlers:
+        # Suppress logging output in preview mode
+        if is_preview:
+            logger.addHandler(logging.NullHandler())
+            return logger
+
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
         # File handler
