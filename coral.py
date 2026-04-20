@@ -14,6 +14,8 @@ L_RED = '\033[1;31m'
 YELLOW = '\033[0;33m'
 RESET = '\033[0m'
 
+CRUSH_ITEM_NONE = 0x7fffffff
+
 def main():
     parser = argparse.ArgumentParser(description="Coral (Clyso Optimized RebALancer)")
     parser.add_argument('--preview', action='store_true', help="Show the future cluster state")
@@ -207,7 +209,7 @@ def calculate_usage(cluster_state, logger):
             # Calculate current usage
             for osd in cluster_state['pgs'][pg]['acting']:
                 # Skip non-existent OSDs
-                if osd == 2147483647:
+                if osd == CRUSH_ITEM_NONE:
                     continue
 
                 if replica:
@@ -219,7 +221,7 @@ def calculate_usage(cluster_state, logger):
             # Calculate future usage
             for osd in cluster_state['pgs'][pg]['up']:
                 # Skip non-existent OSDs
-                if osd == 2147483647:
+                if osd == CRUSH_ITEM_NONE:
                     continue
 
                 if replica:
