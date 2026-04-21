@@ -75,6 +75,7 @@ def get_cluster_state(cluster, logger):
     cluster_state['pgs'] = get_pg_info(cluster, logger)
     cluster_state['pools'] = get_pool_info(cluster, logger)
     cluster_state['crush_rules'] = get_crush_rules(cluster, logger)
+    cluster_state['full_ratio'] = get_full_ratio(cluster, logger)
 
     # Return the cluster information
     return cluster_state
@@ -168,6 +169,22 @@ def get_pool_info(cluster, logger):
             pool_info[pool['pool_id']]['m'] = int(ec_profile['m'])
 
     return pool_info
+
+def get_full_ratio(cluster, logger):
+    logger.debug("Fetching full_ratio")
+
+    # Grab the cluster's full ratio so we know the max percentage full an OSD can be
+    cmd = {'prefix': 'osd dump', 'format': 'json'}
+    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
+    osd_dump = json.loads(output.decode('utf-8'))
+
+    full_ratio = osd_dump.get('full_ratio')
+    if full_ratio is None:
+        logger.warning("full_ratio not found in the 'osd dump'. Defaulting to 0.95")
+        full_ratio = 0.95
+    logger.debug(f"Cluster full_ratio is {full_ratio}")
+
+    return full_ratio
 
 def get_crush_rules(cluster, logger):
     logger.debug("Gathering CRUSH rules")
