@@ -24,7 +24,17 @@ def main():
     logger = setup_logging("/var/log/ceph/coral.log", is_preview=args.preview)
     logger.info("Initializing Coral Balancer")
 
-    cluster_state = get_cluster_state(logger)
+    # Connect to the cluster
+    logger.debug("Connecting to Ceph cluster")
+    cluster = rados.Rados(conffile="/etc/ceph/ceph.conf")
+    cluster.connect()
+
+    # Get the current state of the cluster
+    cluster_state = get_cluster_state(cluster, logger)
+
+    # Disconnect from the cluster
+    logger.debug("Disconnecting from Ceph cluster")
+    cluster.shutdown()
 
     calculate_usage(cluster_state, logger)
     display_usage(cluster_state)
@@ -58,22 +68,13 @@ def setup_logging(log_file, is_preview=False):
 
     return logger
 
-def get_cluster_state(logger):
-    # Connect to the cluster
-    logger.debug("Connecting to Ceph cluster")
-    cluster = rados.Rados(conffile="/etc/ceph/ceph.conf")
-    cluster.connect()
-
+def get_cluster_state(cluster, logger):
     # Gather the data we need
     cluster_state = {}
     cluster_state['osds'] = get_osd_info(cluster, logger)
     cluster_state['pgs'] = get_pg_info(cluster, logger)
     cluster_state['pools'] = get_pool_info(cluster, logger)
     cluster_state['crush_rules'] = get_crush_rules(cluster, logger)
-
-    # Disconnect from the cluster
-    logger.debug("Disconnecting from Ceph cluster")
-    cluster.shutdown()
 
     # Return the cluster information
     return cluster_state
