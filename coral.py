@@ -74,7 +74,7 @@ def get_cluster_state(cluster, logger):
     cluster_state['osds'] = get_osd_info(cluster, logger)
     cluster_state['pgs'] = get_pg_info(cluster, logger)
     cluster_state['pools'] = get_pool_info(cluster, logger)
-    cluster_state['crush_rules'] = get_crush_rules(cluster, logger)
+    cluster_state['osd_bucket_maps'] = get_osd_bucket_maps(cluster, logger)
     cluster_state['full_ratio'] = get_full_ratio(cluster, logger)
 
     # Return the cluster information
@@ -186,7 +186,27 @@ def get_full_ratio(cluster, logger):
 
     return full_ratio
 
-def get_crush_rules(cluster, logger):
+def get_rule_failure_domain(rule):
+    """Return the bucket type that is the failure domain for a CRUSH rule
+
+    Get the last choose/chooseleaf step before an emit in the CRUSH rule.
+    """
+
+    # Search for chooseleaf first
+    for step in rule.get('steps', []):
+        op = step.get('op', '')
+        if op.startswith('chooseleaf_') or op.startswith('choose_'):
+            last_step = step['type']
+
+    return last_step
+
+def get_osd_bucket_maps(cluster, logger):
+    """Build failure-domain (rack/host/etc.) -> OSDs mappings
+
+    For each failure-domain type referenced by a CRUSH rule, walk the CRUSH
+    tree and record which OSDs are underneath it.
+    """
+
     logger.debug("Gathering CRUSH rules")
 
     # Grab all the CRUSH rules
@@ -201,7 +221,48 @@ def get_crush_rules(cluster, logger):
             'steps': rule['steps']
         }
 
-    return crush_rules
+    # Get the failure-domain for each CRUSH rule
+    failure_domain_types = []
+    for rule in crush_rules.values():
+        failure_domain = get_rule_failure_domain(rule)
+        if failure_domain not in failure_domain_types:
+            failure_domain_types.append(failure_domain)
+
+    logger.debug("Gathering CRUSH tree")
+
+    # Grab the CRUSH tree
+    cmd = {'prefix': 'osd crush tree', 'format': 'json'}
+    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
+    crush_tree = json.loads(output.decode('utf-8'))
+
+    logger.debug("Building failure-domain to OSDs maps")
+
+    # Create a mapping of all CRUSH IDs to their parent IDs
+    nodes = {n['id']: n for n in crush_tree.get('nodes', [])}
+    parent_of = {}
+    for node in crush_tree.get('nodes', []):
+        for child_id in node.get('children', []):
+            parent_of[child_id] = node['id']
+
+    bucket_maps = {}
+    for failure_domain_type in failure_domain_types:
+        print(f"Processing failure-domain: {failure_domain}")
+        m = {}
+        for node in crush_tree.get('nodes', []):
+            # We only care about OSDs, so skip the others
+            if node.get('type') != 'osd':
+                continue
+            cur = node['id']
+            while cur in parent_of:
+                pid = parent_of[cur]
+                parent = nodes.get(pid, {})
+                if parent.get('type') == failure_domain_type:
+                    m[node['id']] = parent['name']
+                    break
+                cur = pid
+        bucket_maps[failure_domain_type] = m
+
+    return bucket_maps
 
 # Loop through each pg in a pool and add the appropriate amount to each OSD
 def calculate_usage(cluster_state, logger):
