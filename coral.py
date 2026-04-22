@@ -18,7 +18,10 @@ CRUSH_ITEM_NONE = 0x7fffffff
 
 def main():
     parser = argparse.ArgumentParser(description="Coral (Clyso Optimized RebALancer)")
-    parser.add_argument('--preview', action='store_true', help="Show the future cluster state")
+    parser.add_argument('--preview', action='store_true',
+                        help="Show the future cluster state")
+    parser.add_argument('--dry-run', action='store_true',
+                        help="Don't modify the pg upmaps, print out the pg-upmap-items commands instead")
     args = parser.parse_args()
 
     logger = setup_logging("/var/log/ceph/coral.log", is_preview=args.preview)
@@ -246,7 +249,6 @@ def get_osd_bucket_maps(cluster, logger):
 
     bucket_maps = {}
     for failure_domain_type in failure_domain_types:
-        print(f"Processing failure-domain: {failure_domain}")
         m = {}
         for node in crush_tree.get('nodes', []):
             # We only care about OSDs, so skip the others
