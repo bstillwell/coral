@@ -38,15 +38,15 @@ def main():
     # Get the current state of the cluster
     cluster_state = get_cluster_state(cluster, logger)
 
-    # Disconnect from the cluster
-    logger.debug("Disconnecting from Ceph cluster")
-    cluster.shutdown()
-
     # Calculate future OSD usage based on the 'up' set
     calculate_usage(cluster_state, logger)
 
     # Provide a nice display of current and future OSD usage
     display_usage(cluster_state)
+
+    # Disconnect from the cluster
+    logger.debug("Disconnecting from Ceph cluster")
+    cluster.shutdown()
 
 def setup_logging(log_file, is_preview=False):
     logger = logging.getLogger('Coral')
