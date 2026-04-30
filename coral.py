@@ -25,7 +25,7 @@ def main():
     args = parser.parse_args()
 
     is_preview = args.preview
-    is_dryrun = args.dry_run
+    is_dryrun = args.dry_run or is_preview
 
     logger = setup_logging("/var/log/ceph/coral.log", is_preview=args.preview)
     logger.info("Initializing Coral Balancer")
