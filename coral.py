@@ -190,8 +190,8 @@ def get_backfillfull_ratio(cluster, logger):
     backfillfull_ratio = osd_dump.get('backfillfull_ratio')
     if backfillfull_ratio is None:
         logger.warning("backfillfull_ratio not found in the 'osd dump'. Defaulting to 0.95")
-        full_ratio = 0.95
-    logger.debug(f"Cluster backfillfull_ratio is {full_ratio}")
+        backfillfull_ratio = 0.95
+    logger.debug(f"Cluster backfillfull_ratio is {backfillfull_ratio}")
 
     return backfillfull_ratio
 
