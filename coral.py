@@ -24,6 +24,9 @@ def main():
                         help="Don't modify the pg upmaps, print out the pg-upmap-items commands instead")
     args = parser.parse_args()
 
+    is_preview = args.preview
+    is_dryrun = args.dry_run
+
     logger = setup_logging("/var/log/ceph/coral.log", is_preview=args.preview)
     logger.info("Initializing Coral Balancer")
 
@@ -39,7 +42,10 @@ def main():
     logger.debug("Disconnecting from Ceph cluster")
     cluster.shutdown()
 
+    # Calculate future OSD usage based on the 'up' set
     calculate_usage(cluster_state, logger)
+
+    # Provide a nice display of current and future OSD usage
     display_usage(cluster_state)
 
 def setup_logging(log_file, is_preview=False):
@@ -78,7 +84,7 @@ def get_cluster_state(cluster, logger):
     cluster_state['pgs'] = get_pg_info(cluster, logger)
     cluster_state['pools'] = get_pool_info(cluster, logger)
     cluster_state['osd_bucket_maps'] = get_osd_bucket_maps(cluster, logger)
-    cluster_state['full_ratio'] = get_full_ratio(cluster, logger)
+    cluster_state['backfillfull_ratio'] = get_backfillfull_ratio(cluster, logger)
 
     # Return the cluster information
     return cluster_state
@@ -125,7 +131,7 @@ def get_pg_info(cluster, logger):
         pg_info[pg['pgid']] = {
             'up': pg['up'].copy(),
             'acting': pg['acting'].copy(),
-            'state': pg['state'],
+            'state': pg['state'].split('+'),
             'num_bytes': pg['stat_sum']['num_bytes'],
             'upmaps': []
         }
@@ -173,21 +179,21 @@ def get_pool_info(cluster, logger):
 
     return pool_info
 
-def get_full_ratio(cluster, logger):
-    logger.debug("Fetching full_ratio")
+def get_backfillfull_ratio(cluster, logger):
+    logger.debug("Fetching backfillfull_ratio")
 
     # Grab the cluster's full ratio so we know the max percentage full an OSD can be
     cmd = {'prefix': 'osd dump', 'format': 'json'}
     ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
     osd_dump = json.loads(output.decode('utf-8'))
 
-    full_ratio = osd_dump.get('full_ratio')
-    if full_ratio is None:
-        logger.warning("full_ratio not found in the 'osd dump'. Defaulting to 0.95")
+    backfillfull_ratio = osd_dump.get('backfillfull_ratio')
+    if backfillfull_ratio is None:
+        logger.warning("backfillfull_ratio not found in the 'osd dump'. Defaulting to 0.95")
         full_ratio = 0.95
-    logger.debug(f"Cluster full_ratio is {full_ratio}")
+    logger.debug(f"Cluster backfillfull_ratio is {full_ratio}")
 
-    return full_ratio
+    return backfillfull_ratio
 
 def get_rule_failure_domain(rule):
     """Return the bucket type that is the failure domain for a CRUSH rule
