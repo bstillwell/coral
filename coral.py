@@ -85,6 +85,7 @@ def get_cluster_state(cluster, logger):
     cluster_state['pools'] = get_pool_info(cluster, logger)
     cluster_state['osd_bucket_maps'] = get_osd_bucket_maps(cluster, logger)
     cluster_state['backfillfull_ratio'] = get_backfillfull_ratio(cluster, logger)
+    cluster_state['upmap_queue'] = {}
 
     # Return the cluster information
     return cluster_state
@@ -316,6 +317,17 @@ def calculate_usage(cluster_state, logger):
                 else:
                     cluster_state['osds'][osd]['future_usage'] += cluster_state['pgs'][pg]['num_bytes'] / cluster_state['pools'][pool]['k']
                 cluster_state['osds'][osd]['future_pgs'] += 1
+
+def queue_upmap_mapping_removal(cluster_state, pgid, mapping, logger):
+    logger.debug(f"Queueing upmap mapping removal for {pgid}: Removing {mapping} from {cluster_state['pgs'][pgid]['upmaps']}")
+
+    from_osd, to_osd = mapping
+    cluster_state['pgs'][pgid]['upmaps'].remove(mapping)
+    cluster_state['osds'][from_osd]['future_usage'] += cluster_state['pgs'][pgid]['num_bytes']
+    cluster_state['osds'][from_osd]['future_pgs'] += 1
+    cluster_state['osds'][to_osd]['future_usage'] -= cluster_state['pgs'][pgid]['num_bytes']
+    cluster_state['osds'][to_osd]['future_pgs'] -= 1
+    cluster_state['upmap_queue'][pgid] = cluster_state['pgs'][pgid]['upmaps']
 
 def display_usage(cluster_state):
     # Calculate data per OSD after backfilling is complete
