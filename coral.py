@@ -45,7 +45,7 @@ def main():
     remove_overfull_mappings(cluster_state, logger)
 
     # Apply the changes we determined were needed
-    apply_upmap_queue(cluster_state, is_dryrun, logger)
+    apply_upmap_queue(cluster, cluster_state, is_dryrun, logger)
 
     # Provide a nice display of current and future OSD usage
     display_usage(cluster_state)
@@ -354,17 +354,27 @@ def remove_overfull_mappings(cluster_state, logger):
                 if future_pct < backfillfull_ratio:
                     break
 
-def apply_upmap_queue(cluster_state, is_dryrun, logger):
+def apply_upmap_queue(cluster, cluster_state, is_dryrun, logger):
     logger.debug("Applying upmap changes")
 
     upmap_queue = cluster_state['upmap_queue']
     for pgid in upmap_queue:
         mappings = upmap_queue[pgid]
         if len(mappings) == 0:
-            print(f"ceph osd rm-pg-upmap-items {pgid}")
+            if is_dryrun:
+                print(f"ceph osd rm-pg-upmap-items {pgid}")
+            else:
+                logger.info(f"Removing upmap items for {pgid}")
+                cmd = {'prefix': 'osd rm-pg-upmap-items', 'pgid': pgid, 'format': 'json'}
+                ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
         else:
-            mappings_str = " ".join(str(item) for osd in mappings for item in osd)
-            print(f"ceph osd pg-upmap-items {pgid} {mappings_str}")
+            mappings_list = [str(item) for osd in mappings for item in osd]
+            if is_dryrun:
+                print(f"ceph osd pg-upmap-items {pgid} {' '.join(mappings_list)}")
+            else:
+                logger.info(f"Applying upmap items for {pgid}: {mappings}")
+                cmd = {'prefix': 'osd pg-upmap-items', 'pgid': pgid, 'id': mappings_list, 'format': 'json'}
+                ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
 
 def display_usage(cluster_state):
     # Calculate data per OSD after backfilling is complete
