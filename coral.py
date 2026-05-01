@@ -41,6 +41,9 @@ def main():
     # Calculate future OSD usage based on the 'up' set
     calculate_usage(cluster_state, logger)
 
+    # Try and remove upmap mappings that are causing OSDs to exceed the backfillfull_ratio
+    remove_overfull_mappings(cluster_state, logger)
+
     # Provide a nice display of current and future OSD usage
     display_usage(cluster_state)
 
@@ -328,6 +331,25 @@ def queue_upmap_mapping_removal(cluster_state, pgid, mapping, logger):
     cluster_state['osds'][to_osd]['future_usage'] -= cluster_state['pgs'][pgid]['num_bytes']
     cluster_state['osds'][to_osd]['future_pgs'] -= 1
     cluster_state['upmap_queue'][pgid] = cluster_state['pgs'][pgid]['upmaps']
+
+def remove_overfull_mappings(cluster_state, logger):
+    logger.debug("Scanning for OSDs exceeding backfillfull_ratio due to upmaps")
+
+    backfillfull_ratio = cluster_state['backfillfull_ratio']
+
+    for osd_id, osd_info in cluster_state['osds'].items():
+        future_pct = osd_info['future_usage'] / osd_info['size']
+        if future_pct >= backfillfull_ratio:
+            logger.info(f"osd.{osd_id} exceeds the backfillfull_ratio ({future_pct} > {backfillfull_ratio}")
+
+            for pgid, pg_info in cluster_state['pgs'].items():
+                for from_osd, to_osd in pg_info['upmaps']:
+                    if to_osd == osd_id:
+                        queue_upmap_mapping_removal(cluster_state, pgid, (from_osd, to_osd), logger)
+                        future_pct = osd_info['future_usage'] / osd_info['size']
+                        continue
+                if future_pct < backfillfull_ratio:
+                    break
 
 def display_usage(cluster_state):
     # Calculate data per OSD after backfilling is complete
