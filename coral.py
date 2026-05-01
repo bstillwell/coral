@@ -44,6 +44,9 @@ def main():
     # Try and remove upmap mappings that are causing OSDs to exceed the backfillfull_ratio
     remove_overfull_mappings(cluster_state, logger)
 
+    # Apply the changes we determined were needed
+    apply_upmap_queue(cluster_state, is_dryrun, logger)
+
     # Provide a nice display of current and future OSD usage
     display_usage(cluster_state)
 
@@ -350,6 +353,18 @@ def remove_overfull_mappings(cluster_state, logger):
                         continue
                 if future_pct < backfillfull_ratio:
                     break
+
+def apply_upmap_queue(cluster_state, is_dryrun, logger):
+    logger.debug("Applying upmap changes")
+
+    upmap_queue = cluster_state['upmap_queue']
+    for pgid in upmap_queue:
+        mappings = upmap_queue[pgid]
+        if len(mappings) == 0:
+            print(f"ceph osd rm-pg-upmap-items {pgid}")
+        else:
+            mappings_str = " ".join(str(item) for osd in mappings for item in osd)
+            print(f"ceph osd pg-upmap-items {pgid} {mappings_str}")
 
 def display_usage(cluster_state):
     # Calculate data per OSD after backfilling is complete
