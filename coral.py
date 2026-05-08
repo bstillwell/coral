@@ -89,6 +89,7 @@ def get_cluster_state(cluster, logger):
     cluster_state['osds'] = get_osd_info(cluster, logger)
     cluster_state['pgs'] = get_pg_info(cluster, logger)
     cluster_state['pools'] = get_pool_info(cluster, logger)
+    cluster_state['crush_rules'] = get_crush_rules(cluster, logger)
     cluster_state['osd_bucket_maps'] = get_osd_bucket_maps(cluster, logger)
     cluster_state['backfillfull_ratio'] = get_backfillfull_ratio(cluster, logger)
     cluster_state['upmap_queue'] = {}
@@ -185,6 +186,23 @@ def get_pool_info(cluster, logger):
             pool_info[pool['pool_id']]['m'] = int(ec_profile['m'])
 
     return pool_info
+
+def get_crush_rules(cluster, logger):
+    logger.debug("Gathering CRUSH rules")
+
+    # Grab all the CRUSH rules
+    cmd = {'prefix': 'osd crush rule dump', 'format': 'json'}
+    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
+    crush_rule_dump = json.loads(output.decode('utf-8'))
+
+    crush_rules = {}
+    for rule in crush_rule_dump:
+        crush_rules[rule['rule_id']] = {
+            'name': rule['rule_name'],
+            'steps': rule['steps']
+        }
+
+    return crush_rules
 
 def get_backfillfull_ratio(cluster, logger):
     logger.debug("Fetching backfillfull_ratio")
