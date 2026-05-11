@@ -1,0 +1,41 @@
+# Coral
+
+Coral (Clyso Optimized RebALancer) is a Ceph cluster rebalancing tool. It analyzes current and future PG placement, detects OSDs whose post-backfill usage would exceed the cluster's `backfillfull_ratio`, and removes the pg_upmap_items responsible.
+
+## Requirements
+
+- Python 3
+- `rados` Python bindings (part of the Ceph client libraries)
+- Access to a Ceph cluster via `/etc/ceph/ceph.conf`
+
+## Usage
+
+```
+./coral.py [--preview] [--dry-run]
+```
+
+| Flag | Behavior |
+|------|----------|
+| _(none)_ | Connect to the cluster, remove overfull upmaps, log to `/var/log/ceph/coral.log` |
+| `--preview` | Show current and future OSD usage table without modifying anything |
+| `--dry-run` | Print the `ceph osd pg-upmap-items` / `ceph osd rm-pg-upmap-items` commands that would be run |
+
+`--dry-run` implies `--preview` — no cluster writes occur in either mode.
+
+## How it works
+
+1. **Gather cluster state** — OSD capacity and status, PG placement (acting and up sets), pool metadata, CRUSH rules, and the cluster `backfillfull_ratio`.
+2. **Calculate usage** — for each OSD, sum the data it holds today (acting set) and where it will land after backfill completes (up set). Erasure-coded pools distribute `num_bytes / k` per OSD; replica pools distribute the full `num_bytes`.
+3. **Remove overfull upmaps** — any OSD whose projected usage meets or exceeds `backfillfull_ratio` has the upmap redirections sending data to it removed, then usage is recalculated.
+4. **Apply changes** — the queued upmap modifications are sent to the MON via RADOS.
+5. **Display results** — a color-coded table shows each OSD's size, current usage, future usage, and the delta.
+
+## Output
+
+```
+OSD  | Class | Weight   | Size        | Current Usage              | Future Usage               | Change
+-----+-------+----------+-------------+----------------------------+----------------------------+----------------------------
+0    | hdd   |  1.00000 |  3726.0 GiB |  800.3 GiB   21.5%   42 PGs |  850.1 GiB   22.8%   44 PGs |  +49.8 GiB    +1.3%   +2 PGs
+```
+
+Usage percentage is color-coded: green (>0%), yellow (>80%), red (>90%), bright red (>100%).
