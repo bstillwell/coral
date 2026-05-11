@@ -21,6 +21,15 @@ Coral (Clyso Optimized RebALancer) is a Ceph cluster rebalancing tool. It analyz
 
 Requires the `rados` Python package (Ceph RADOS bindings) and a reachable Ceph cluster at `/etc/ceph/ceph.conf`.
 
+## Tests
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/bin/pytest tests/ -v
+```
+
+No Ceph cluster required — `rados` is mocked via `sys.modules` in `tests/conftest.py` before `coral` is imported.
+
 ## Architecture
 
 All state lives in a single `cluster_state` dict built by `get_cluster_state()`, which calls:
