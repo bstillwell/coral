@@ -38,7 +38,7 @@ All state lives in a single `cluster_state` dict built by `get_cluster_state()`,
 get_osd_info()        → osds: up/in/crush_weight/size/device_class
 get_pg_info()         → pgs: up/acting sets, num_bytes, existing upmaps
 get_pool_info()       → pools: type (replica|erasure), crush_rule, k/m for EC
-get_crush_rules()     → crush_rules: rule steps
+get_crush_rules()     → crush_rules: rule steps, valid_osds (OSDs the rule can target, resolved via the recursive get_osds_in_bucket() helper)
 get_osd_bucket_maps() → osd_bucket_maps: failure-domain → OSD → bucket
 get_backfillfull_ratio() → backfillfull_ratio float
 ```
