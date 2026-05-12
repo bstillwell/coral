@@ -43,6 +43,8 @@ get_osd_bucket_maps() → osd_bucket_maps: failure-domain → OSD → bucket
 get_backfillfull_ratio() → backfillfull_ratio float
 ```
 
+`get_cluster_state()` finishes by calling `calculate_pg_distribution()`, which fills in `osds[osd_id]['target_pgs_by_pool'][pool_id] = (floor, ceil)` — the per-OSD min/max PG count for a balanced cluster, derived from the OSD's CRUSH-weight share among the pool rule's `valid_osds`, scaled by `pg_num * pool_size` (replica count or k+m). OSDs whose `crush_weight < 0.0001` are treated as zero so they don't pull a share away from the rest.
+
 After `calculate_usage()` populates `current_usage`/`future_usage` per OSD, `remove_overfull_mappings()` iteratively finds OSDs where `future_usage/size >= backfillfull_ratio` and queues removal of upmap items redirecting data to those OSDs via `queue_upmap_mapping_removal()`. Finally `apply_upmap_queue()` sends `osd pg-upmap-items` / `osd rm-pg-upmap-items` commands to the cluster.
 
 ## RADOS Communication
