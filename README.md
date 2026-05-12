@@ -24,7 +24,7 @@ Coral (Clyso Optimized RebALancer) is a Ceph cluster rebalancing tool. It analyz
 
 ## How it works
 
-1. **Gather cluster state** — OSD capacity and status, PG placement (acting and up sets), pool metadata, CRUSH rules (including the set of OSDs each rule can target), and the cluster `backfillfull_ratio`.
+1. **Gather cluster state** — OSD capacity and status, PG placement (acting and up sets), pool metadata, CRUSH rules (including the set of OSDs each rule can target), and the cluster `backfillfull_ratio`. Per-OSD min/max PG targets for each pool are also derived from each OSD's CRUSH-weight share among the rule's eligible OSDs, scaled by `pg_num` and pool size.
 2. **Calculate usage** — for each OSD, sum the data it holds today (acting set) and where it will land after backfill completes (up set). Erasure-coded pools distribute `num_bytes / k` per OSD; replica pools distribute the full `num_bytes`.
 3. **Remove overfull upmaps** — any OSD whose projected usage meets or exceeds `backfillfull_ratio` has the upmap redirections sending data to it removed, then usage is recalculated.
 4. **Apply changes** — the queued upmap modifications are sent to the MON via RADOS.
