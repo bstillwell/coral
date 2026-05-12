@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import math
 import rados
 import sys
 
@@ -93,6 +94,8 @@ def get_cluster_state(cluster, logger):
     cluster_state['osd_bucket_maps'] = get_osd_bucket_maps(cluster, logger)
     cluster_state['backfillfull_ratio'] = get_backfillfull_ratio(cluster, logger)
     cluster_state['upmap_queue'] = {}
+
+    calculate_pg_distribution(cluster_state, logger)
 
     # Return the cluster information
     return cluster_state
@@ -329,6 +332,33 @@ def get_osd_bucket_maps(cluster, logger):
         bucket_maps[failure_domain_type] = m
 
     return bucket_maps
+
+def calculate_pg_distribution(cluster_state, logger):
+    logger.debug("Calculating target PG distribution per OSD per pool")
+
+    for osd_id in cluster_state['osds']:
+        cluster_state['osds'][osd_id]['target_pgs_by_pool'] = {}
+
+    for pool_id, pool in cluster_state['pools'].items():
+        valid_osds = cluster_state['crush_rules'][pool['crush_rule']]['valid_osds']
+
+        # Treat negligible-weight OSDs as zero so they neither receive PGs nor
+        # affect the proportions for the rest
+        weights = {}
+        for osd_id in valid_osds:
+            w = cluster_state['osds'][osd_id]['crush_weight']
+            weights[osd_id] = w if w >= 0.0001 else 0.0
+        total_weight = sum(weights.values())
+
+        for osd_id, weight in weights.items():
+            if total_weight == 0:
+                ideal = 0.0
+            else:
+                ideal = (weight / total_weight) * pool['pgs'] * pool['size']
+            cluster_state['osds'][osd_id]['target_pgs_by_pool'][pool_id] = (
+                math.floor(ideal),
+                math.ceil(ideal),
+            )
 
 # Loop through each pg in a pool and add the appropriate amount to each OSD
 def calculate_usage(cluster_state, logger):
