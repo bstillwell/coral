@@ -112,6 +112,32 @@ class TestGetCrushRules:
         result = coral.get_crush_rules(mock_cluster, logger)
         assert len(result[0]["steps"]) == 3
 
+    def test_includes_valid_osds(self, mock_cluster, logger):
+        result = coral.get_crush_rules(mock_cluster, logger)
+        assert result[0]["valid_osds"] == [0, 1]
+
+
+class TestGetOsdsInBucket:
+    nodes = {
+        -1: {"id": -1, "name": "default", "type": "root", "children": [-2, -3]},
+        -2: {"id": -2, "name": "host0", "type": "host", "children": [0]},
+        -3: {"id": -3, "name": "host1", "type": "host", "children": [1]},
+        0: {"id": 0, "name": "osd.0", "type": "osd", "children": []},
+        1: {"id": 1, "name": "osd.1", "type": "osd", "children": []},
+    }
+
+    def test_returns_all_osds_under_root(self):
+        assert coral.get_osds_in_bucket(-1, self.nodes) == {0, 1}
+
+    def test_returns_only_osds_under_host(self):
+        assert coral.get_osds_in_bucket(-2, self.nodes) == {0}
+
+    def test_returns_self_when_given_an_osd(self):
+        assert coral.get_osds_in_bucket(0, self.nodes) == {0}
+
+    def test_returns_empty_for_unknown_id(self):
+        assert coral.get_osds_in_bucket(999, self.nodes) == set()
+
 
 class TestGetOsdBucketMaps:
     def test_maps_osds_to_host_bucket(self, mock_cluster, logger):

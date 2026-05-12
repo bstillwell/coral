@@ -187,6 +187,17 @@ def get_pool_info(cluster, logger):
 
     return pool_info
 
+def get_osds_in_bucket(bucket_id, nodes):
+    node = nodes.get(bucket_id)
+    if node is None:
+        return set()
+    if node.get('type') == 'osd':
+        return {node['id']}
+    osds = set()
+    for child_id in node.get('children', []):
+        osds.update(get_osds_in_bucket(child_id, nodes))
+    return osds
+
 def get_crush_rules(cluster, logger):
     logger.debug("Gathering CRUSH rules")
 
@@ -195,11 +206,31 @@ def get_crush_rules(cluster, logger):
     ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
     crush_rule_dump = json.loads(output.decode('utf-8'))
 
+    # Grab the CRUSH tree so we can resolve which OSDs each rule can target
+    cmd = {'prefix': 'osd crush tree', 'format': 'json'}
+    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
+    crush_tree = json.loads(output.decode('utf-8'))
+
+    nodes = {n['id']: n for n in crush_tree.get('nodes', [])}
+    name_to_id = {n['name']: n['id'] for n in crush_tree.get('nodes', [])}
+
     crush_rules = {}
     for rule in crush_rule_dump:
+        valid_osds = set()
+        for step in rule['steps']:
+            if step.get('op') != 'take':
+                continue
+            item_name = step.get('item_name')
+            bucket_id = name_to_id.get(item_name)
+            if bucket_id is None:
+                logger.warning(f"CRUSH rule {rule['rule_name']!r} references unknown bucket {item_name!r}")
+                continue
+            valid_osds.update(get_osds_in_bucket(bucket_id, nodes))
+
         crush_rules[rule['rule_id']] = {
             'name': rule['rule_name'],
-            'steps': rule['steps']
+            'steps': rule['steps'],
+            'valid_osds': sorted(valid_osds),
         }
 
     return crush_rules
