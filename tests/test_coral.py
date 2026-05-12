@@ -116,6 +116,38 @@ class TestGetCrushRules:
         result = coral.get_crush_rules(mock_cluster, logger)
         assert result[0]["valid_osds"] == [0, 1]
 
+    def test_resolves_device_class_shadow_buckets(self, logger):
+        shadow_tree = {
+            "nodes": [
+                {"id": -1, "name": "default", "type": "root", "children": [-2, -3]},
+                {"id": -2, "name": "host0", "type": "host", "children": [0]},
+                {"id": -3, "name": "host1", "type": "host", "children": [1]},
+                {"id": 0, "name": "osd.0", "type": "osd", "children": []},
+                {"id": 1, "name": "osd.1", "type": "osd", "children": []},
+                {"id": -10, "name": "default~hdd", "type": "root", "children": [-11]},
+                {"id": -11, "name": "host0~hdd", "type": "host", "children": [0]},
+                {"id": -20, "name": "default~ssd", "type": "root", "children": [-21]},
+                {"id": -21, "name": "host1~ssd", "type": "host", "children": [1]},
+            ]
+        }
+        rules = [
+            {"rule_id": 0, "rule_name": "hdd_rule", "steps": [
+                {"op": "take", "item_name": "default~hdd"},
+                {"op": "chooseleaf_firstn", "num": 0, "type": "host"},
+                {"op": "emit"},
+            ]},
+            {"rule_id": 1, "rule_name": "ssd_rule", "steps": [
+                {"op": "take", "item_name": "default~ssd"},
+                {"op": "chooseleaf_firstn", "num": 0, "type": "host"},
+                {"op": "emit"},
+            ]},
+        ]
+        cluster = make_mock_cluster({"osd crush tree": shadow_tree, "osd crush rule dump": rules})
+        result = coral.get_crush_rules(cluster, logger)
+        assert result[0]["valid_osds"] == [0]
+        assert result[1]["valid_osds"] == [1]
+        logger.warning.assert_not_called()
+
 
 class TestGetOsdsInBucket:
     nodes = {

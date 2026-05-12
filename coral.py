@@ -206,8 +206,10 @@ def get_crush_rules(cluster, logger):
     ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
     crush_rule_dump = json.loads(output.decode('utf-8'))
 
-    # Grab the CRUSH tree so we can resolve which OSDs each rule can target
-    cmd = {'prefix': 'osd crush tree', 'format': 'json'}
+    # Grab the CRUSH tree so we can resolve which OSDs each rule can target.
+    # --show-shadow makes Ceph include the device-class shadow buckets (e.g.
+    # 'default~hdd'), which class-scoped rules' `take` steps reference.
+    cmd = {'prefix': 'osd crush tree', 'shadow': '--show-shadow', 'format': 'json'}
     ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
     crush_tree = json.loads(output.decode('utf-8'))
 
