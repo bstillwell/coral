@@ -422,6 +422,8 @@ def remove_overfull_mappings(cluster_state, logger):
     backfillfull_ratio = cluster_state['backfillfull_ratio']
 
     for osd_id, osd_info in cluster_state['osds'].items():
+        if osd_info['size'] == 0:
+            continue
         future_pct = osd_info['future_usage'] / osd_info['size']
         if future_pct >= backfillfull_ratio:
             logger.info(f"osd.{osd_id} exceeds the backfillfull_ratio ({future_pct} > {backfillfull_ratio}")

@@ -356,3 +356,8 @@ class TestRemoveOverfullMappings:
         base_cluster_state["osds"][1]["future_usage"] = int(9.5 * GiB)
         coral.remove_overfull_mappings(base_cluster_state, logger)
         assert base_cluster_state["osds"][0]["future_usage"] == GiB
+
+    def test_skips_zero_size_osd(self, base_cluster_state, logger):
+        base_cluster_state["osds"][1]["size"] = 0
+        base_cluster_state["osds"][1]["future_usage"] = GiB
+        coral.remove_overfull_mappings(base_cluster_state, logger)  # must not raise ZeroDivisionError
