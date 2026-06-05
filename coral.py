@@ -42,8 +42,9 @@ def main():
     # Calculate future OSD usage based on the 'up' set
     calculate_usage(cluster_state, logger)
 
-    # Remove upmap mappings that push OSDs outside their per-pool target range
-    remove_off_target_mappings(cluster_state, logger)
+    # TODO: re-enable once remove_off_target_mappings is rewritten to reduce
+    # the total upmap mapping count
+    # remove_off_target_mappings(cluster_state, logger)
 
     # Apply the changes we determined were needed
     apply_upmap_queue(cluster, cluster_state, is_dryrun, logger)
