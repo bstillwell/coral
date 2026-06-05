@@ -46,6 +46,9 @@ def main():
     # the total upmap mapping count
     # remove_off_target_mappings(cluster_state, logger)
 
+    # Add new upmap mappings to pull off-target OSDs into their per-pool range
+    balance_off_target_osds(cluster_state, logger)
+
     # Apply the changes we determined were needed
     apply_upmap_queue(cluster, cluster_state, is_dryrun, logger)
 
@@ -448,6 +451,93 @@ def remove_off_target_mappings(cluster_state, logger):
                     f"from_count={from_count}/floor={from_floor}]"
                 )
                 queue_upmap_mapping_removal(cluster_state, pgid, (from_osd, to_osd), logger)
+
+def queue_upmap_mapping_addition(cluster_state, pgid, mapping, logger):
+    logger.debug(f"Queueing upmap mapping addition for {pgid}: Adding {mapping} to {cluster_state['pgs'][pgid]['upmaps']}")
+
+    from_osd, to_osd = mapping
+    pool_id = int(pgid.split('.')[0])
+    cluster_state['pgs'][pgid]['upmaps'].append(mapping)
+
+    # Reflect the new placement in the up set so subsequent iterations see it
+    up = cluster_state['pgs'][pgid]['up']
+    for i, osd in enumerate(up):
+        if osd == from_osd:
+            up[i] = to_osd
+            break
+
+    cluster_state['osds'][from_osd]['future_usage'] -= cluster_state['pgs'][pgid]['num_bytes']
+    cluster_state['osds'][from_osd]['future_pgs'] -= 1
+    cluster_state['osds'][from_osd]['future_pgs_by_pool'][pool_id] = \
+        cluster_state['osds'][from_osd]['future_pgs_by_pool'].get(pool_id, 0) - 1
+    cluster_state['osds'][to_osd]['future_usage'] += cluster_state['pgs'][pgid]['num_bytes']
+    cluster_state['osds'][to_osd]['future_pgs'] += 1
+    cluster_state['osds'][to_osd]['future_pgs_by_pool'][pool_id] = \
+        cluster_state['osds'][to_osd]['future_pgs_by_pool'].get(pool_id, 0) + 1
+    cluster_state['upmap_queue'][pgid] = cluster_state['pgs'][pgid]['upmaps']
+
+def balance_off_target_osds(cluster_state, logger):
+    logger.debug("Adding upmap mappings to pull off-target OSDs into their per-pool range")
+
+    osds = cluster_state['osds']
+
+    for pool_id, pool in cluster_state['pools'].items():
+        rule = cluster_state['crush_rules'][pool['crush_rule']]
+        failure_domain = get_rule_failure_domain(rule)
+        valid_osds = set(rule['valid_osds'])
+        bucket_map = cluster_state['osd_bucket_maps'].get(failure_domain, {})
+
+        while True:
+            over = []
+            for osd_id in valid_osds:
+                ceil = osds[osd_id]['target_pgs_by_pool'].get(pool_id, (0, 0))[1]
+                count = osds[osd_id]['future_pgs_by_pool'].get(pool_id, 0)
+                if count > ceil:
+                    over.append((count - ceil, osd_id))
+            if not over:
+                break
+            over.sort(reverse=True)
+            _, from_osd = over[0]
+
+            under = []
+            for osd_id in valid_osds:
+                floor = osds[osd_id]['target_pgs_by_pool'].get(pool_id, (0, 0))[0]
+                count = osds[osd_id]['future_pgs_by_pool'].get(pool_id, 0)
+                if count < floor:
+                    under.append((floor - count, osd_id))
+            if not under:
+                break
+            under.sort(reverse=True)
+            destinations = [osd_id for _, osd_id in under]
+
+            made_move = False
+            for pgid, pg in cluster_state['pgs'].items():
+                if not pgid.startswith(f"{pool_id}."):
+                    continue
+                if from_osd not in pg['up']:
+                    continue
+                for to_osd in destinations:
+                    if to_osd in pg['up']:
+                        continue
+                    to_bucket = bucket_map.get(to_osd)
+                    peer_buckets = {
+                        bucket_map.get(o) for o in pg['up']
+                        if o != from_osd and o != CRUSH_ITEM_NONE
+                    }
+                    if to_bucket in peer_buckets:
+                        continue
+                    logger.info(
+                        f"Adding balancing upmap {pgid}: ({from_osd} -> {to_osd}) "
+                        f"[pool={pool_id}]"
+                    )
+                    queue_upmap_mapping_addition(cluster_state, pgid, (from_osd, to_osd), logger)
+                    made_move = True
+                    break
+                if made_move:
+                    break
+
+            if not made_move:
+                break
 
 def apply_upmap_queue(cluster, cluster_state, is_dryrun, logger):
     logger.debug("Applying upmap changes")

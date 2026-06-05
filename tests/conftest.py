@@ -117,6 +117,62 @@ def logger():
 
 
 @pytest.fixture
+def balance_cluster_state():
+    # 3 OSDs on 3 distinct hosts; pool 1 (replica size 2). OSD 0 is over-target,
+    # OSD 2 is under-target — a single upmap (0 -> 2) on PG 1.0 should balance.
+    return {
+        "osds": {
+            0: {
+                "size": 10 * GiB,
+                "current_usage": GiB, "current_pgs": 1, "current_pgs_by_pool": {1: 1},
+                "future_usage": GiB, "future_pgs": 1, "future_pgs_by_pool": {1: 1},
+                "target_pgs_by_pool": {1: (0, 0)},
+            },
+            1: {
+                "size": 10 * GiB,
+                "current_usage": GiB, "current_pgs": 1, "current_pgs_by_pool": {1: 1},
+                "future_usage": GiB, "future_pgs": 1, "future_pgs_by_pool": {1: 1},
+                "target_pgs_by_pool": {1: (1, 1)},
+            },
+            2: {
+                "size": 10 * GiB,
+                "current_usage": 0, "current_pgs": 0, "current_pgs_by_pool": {1: 0},
+                "future_usage": 0, "future_pgs": 0, "future_pgs_by_pool": {1: 0},
+                "target_pgs_by_pool": {1: (1, 1)},
+            },
+        },
+        "pgs": {
+            "1.0": {
+                "up": [0, 1],
+                "acting": [0, 1],
+                "state": ["active", "clean"],
+                "num_bytes": GiB,
+                "upmaps": [],
+            }
+        },
+        "pools": {
+            1: {"name": "rbd", "type": "replica", "crush_rule": 0, "pgs": 1, "size": 2}
+        },
+        "crush_rules": {
+            0: {
+                "name": "replicated_rule",
+                "steps": [
+                    {"op": "take", "item_name": "default"},
+                    {"op": "chooseleaf_firstn", "num": 0, "type": "host"},
+                    {"op": "emit"},
+                ],
+                "valid_osds": [0, 1, 2],
+            }
+        },
+        "osd_bucket_maps": {
+            "host": {0: "host0", 1: "host1", 2: "host2"},
+        },
+        "backfillfull_ratio": 0.9,
+        "upmap_queue": {},
+    }
+
+
+@pytest.fixture
 def base_cluster_state():
     return {
         "osds": {
