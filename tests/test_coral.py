@@ -456,3 +456,49 @@ class TestBalanceOffTargetOsds:
         balance_cluster_state["osd_bucket_maps"]["host"][2] = "host1"
         coral.balance_off_target_osds(balance_cluster_state, logger)
         assert balance_cluster_state["upmap_queue"] == {}
+
+    def test_falls_back_to_next_over_target_osd_when_top_cannot_move(self, logger):
+        # OSD 0 is the most over-target (excess 2) but its only PG (1.0) can't
+        # move to OSD 2 — OSD 2 shares OSD 1's bucket, blocking the placement.
+        # OSD 3 is also over (excess 1); its PG 1.1 has a valid destination on
+        # OSD 2. The function must try OSD 3 as a source after OSD 0 fails.
+        state = {
+            "osds": {
+                osd_id: {
+                    "size": 10 * GiB,
+                    "current_usage": 0, "current_pgs": 0, "current_pgs_by_pool": {1: 0},
+                    "future_usage": 0, "future_pgs": 0, "future_pgs_by_pool": {1: 0},
+                    "target_pgs_by_pool": {1: (0, 0)},
+                } for osd_id in (0, 1, 2, 3, 4)
+            },
+            "pgs": {
+                "1.0": {"up": [0, 1], "acting": [0, 1], "state": ["active"], "num_bytes": GiB, "upmaps": []},
+                "1.1": {"up": [3, 4], "acting": [3, 4], "state": ["active"], "num_bytes": GiB, "upmaps": []},
+            },
+            "pools": {1: {"name": "rbd", "type": "replica", "crush_rule": 0, "pgs": 2, "size": 2}},
+            "crush_rules": {0: {
+                "name": "r", "valid_osds": [0, 1, 2, 3, 4],
+                "steps": [{"op": "take", "item_name": "default"},
+                          {"op": "chooseleaf_firstn", "num": 0, "type": "host"},
+                          {"op": "emit"}],
+            }},
+            "osd_bucket_maps": {"host": {
+                0: "host0", 1: "host1", 2: "host1",  # OSD 2 shares OSD 1's host -> blocks PG 1.0
+                3: "host2", 4: "host3",
+            }},
+            "upmap_queue": {},
+        }
+        # OSD 0 is most-over (synthetic count=2 vs ceil=0); OSDs 1, 3, 4 each have one PG;
+        # OSD 2 is under by 1. The first iteration tries OSD 0, fails, must try OSD 3.
+        state["osds"][0]["future_pgs_by_pool"][1] = 2
+        state["osds"][1]["target_pgs_by_pool"][1] = (1, 1)
+        state["osds"][1]["future_pgs_by_pool"][1] = 1
+        state["osds"][3]["future_pgs_by_pool"][1] = 1
+        state["osds"][4]["target_pgs_by_pool"][1] = (1, 1)
+        state["osds"][4]["future_pgs_by_pool"][1] = 1
+        state["osds"][2]["target_pgs_by_pool"][1] = (1, 1)
+
+        coral.balance_off_target_osds(state, logger)
+        assert "1.1" in state["upmap_queue"]
+        assert state["upmap_queue"]["1.1"] == [(3, 2)]
+        assert "1.0" not in state["upmap_queue"]
