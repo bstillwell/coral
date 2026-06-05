@@ -45,9 +45,9 @@ get_backfillfull_ratio() → backfillfull_ratio float
 
 `get_cluster_state()` finishes by calling `calculate_pg_distribution()`, which fills in `osds[osd_id]['target_pgs_by_pool'][pool_id] = (floor, ceil)` — the per-OSD min/max PG count for a balanced cluster, derived from the OSD's CRUSH-weight share among the pool rule's `valid_osds`, scaled by `pg_num * pool_size` (replica count or k+m). OSDs whose `crush_weight < 0.0001` are treated as zero so they don't pull a share away from the rest.
 
-`calculate_usage()` populates `current_usage`/`future_usage` and per-pool PG counts (`current_pgs_by_pool` / `future_pgs_by_pool`) per OSD. `remove_off_target_mappings()` then walks every existing upmap and queues removal — via `queue_upmap_mapping_removal()` — whenever the destination OSD's `future_pgs_by_pool[pool_id]` exceeds the per-pool ceil, or the source OSD's count is below the per-pool floor. Finally `apply_upmap_queue()` sends `osd pg-upmap-items` / `osd rm-pg-upmap-items` commands to the cluster.
+`calculate_usage()` populates `current_usage`/`future_usage` and per-pool PG counts (`current_pgs_by_pool` / `future_pgs_by_pool`) per OSD. `balance_off_target_osds()` then walks each pool and queues new upmaps — via `queue_upmap_mapping_addition()` — that move PGs from the most over-ceil OSD to the most under-floor OSD, while respecting the pool's CRUSH rule (`valid_osds`) and failure-domain uniqueness (looked up via `osd_bucket_maps[failure_domain]`). Finally `apply_upmap_queue()` sends `osd pg-upmap-items` / `osd rm-pg-upmap-items` commands to the cluster.
 
-A follow-up function will *add* new upmaps to pull OSDs that are still off-target after removal back into their per-pool range — the other half of balancing.
+`remove_off_target_mappings()` (the inverse — removing existing upmaps that push OSDs off-target) exists but is currently disabled in `main()` pending a rewrite focused on reducing the total upmap mapping count.
 
 ## RADOS Communication
 

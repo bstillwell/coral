@@ -374,3 +374,85 @@ class TestRemoveOffTargetMappings:
         base_cluster_state["osds"][1]["target_pgs_by_pool"] = {}
         coral.remove_off_target_mappings(base_cluster_state, logger)
         assert "1.0" in base_cluster_state["upmap_queue"]
+
+
+class TestQueueUpmapMappingAddition:
+    def test_appends_mapping_to_pg_upmaps(self, balance_cluster_state, logger):
+        coral.queue_upmap_mapping_addition(balance_cluster_state, "1.0", (0, 2), logger)
+        assert (0, 2) in balance_cluster_state["pgs"]["1.0"]["upmaps"]
+
+    def test_replaces_from_osd_in_up_set(self, balance_cluster_state, logger):
+        coral.queue_upmap_mapping_addition(balance_cluster_state, "1.0", (0, 2), logger)
+        assert balance_cluster_state["pgs"]["1.0"]["up"] == [2, 1]
+
+    def test_shifts_byte_counters(self, balance_cluster_state, logger):
+        coral.queue_upmap_mapping_addition(balance_cluster_state, "1.0", (0, 2), logger)
+        assert balance_cluster_state["osds"][0]["future_usage"] == 0
+        assert balance_cluster_state["osds"][2]["future_usage"] == GiB
+
+    def test_shifts_pg_count_counters(self, balance_cluster_state, logger):
+        coral.queue_upmap_mapping_addition(balance_cluster_state, "1.0", (0, 2), logger)
+        assert balance_cluster_state["osds"][0]["future_pgs"] == 0
+        assert balance_cluster_state["osds"][2]["future_pgs"] == 1
+
+    def test_shifts_per_pool_pg_counts(self, balance_cluster_state, logger):
+        coral.queue_upmap_mapping_addition(balance_cluster_state, "1.0", (0, 2), logger)
+        assert balance_cluster_state["osds"][0]["future_pgs_by_pool"][1] == 0
+        assert balance_cluster_state["osds"][2]["future_pgs_by_pool"][1] == 1
+
+    def test_enqueues_pgid(self, balance_cluster_state, logger):
+        coral.queue_upmap_mapping_addition(balance_cluster_state, "1.0", (0, 2), logger)
+        assert "1.0" in balance_cluster_state["upmap_queue"]
+
+
+class TestBalanceOffTargetOsds:
+    def test_queues_upmap_when_osd_over_and_destination_available(self, balance_cluster_state, logger):
+        coral.balance_off_target_osds(balance_cluster_state, logger)
+        assert balance_cluster_state["upmap_queue"]["1.0"] == [(0, 2)]
+
+    def test_updates_counters_after_move(self, balance_cluster_state, logger):
+        coral.balance_off_target_osds(balance_cluster_state, logger)
+        assert balance_cluster_state["osds"][0]["future_pgs_by_pool"][1] == 0
+        assert balance_cluster_state["osds"][2]["future_pgs_by_pool"][1] == 1
+
+    def test_no_op_when_all_osds_on_target(self, balance_cluster_state, logger):
+        # Widen OSD 0's ceil so its count of 1 is on-target
+        balance_cluster_state["osds"][0]["target_pgs_by_pool"][1] = (0, 1)
+        balance_cluster_state["osds"][2]["target_pgs_by_pool"][1] = (0, 0)
+        coral.balance_off_target_osds(balance_cluster_state, logger)
+        assert balance_cluster_state["upmap_queue"] == {}
+
+    def test_no_op_when_no_under_target_osd(self, balance_cluster_state, logger):
+        balance_cluster_state["osds"][2]["target_pgs_by_pool"][1] = (0, 0)
+        coral.balance_off_target_osds(balance_cluster_state, logger)
+        assert balance_cluster_state["upmap_queue"] == {}
+
+    def test_skips_destination_in_same_failure_domain(self, balance_cluster_state, logger):
+        # Put OSD 2 in host1 — same bucket as OSD 1, which is in the up set
+        balance_cluster_state["osd_bucket_maps"]["host"][2] = "host1"
+        coral.balance_off_target_osds(balance_cluster_state, logger)
+        assert balance_cluster_state["upmap_queue"] == {}
+
+    def test_skips_destination_outside_valid_osds(self, balance_cluster_state, logger):
+        balance_cluster_state["crush_rules"][0]["valid_osds"] = [0, 1]
+        # OSD 2 still has a target entry but the rule rejects it
+        coral.balance_off_target_osds(balance_cluster_state, logger)
+        assert balance_cluster_state["upmap_queue"] == {}
+
+    def test_skips_destination_already_in_up_set(self, balance_cluster_state, logger):
+        # Make OSD 1 under-target and OSD 2 over-target; OSD 1 is already in the
+        # PG's up set so it cannot receive the upmap, and no other candidate
+        # exists — function should make no move.
+        balance_cluster_state["osds"][1]["target_pgs_by_pool"][1] = (2, 2)
+        balance_cluster_state["osds"][1]["future_pgs_by_pool"][1] = 1  # below floor
+        balance_cluster_state["osds"][2]["target_pgs_by_pool"][1] = (0, 0)
+        balance_cluster_state["osds"][2]["future_pgs_by_pool"][1] = 1  # above ceil (synthetic)
+        coral.balance_off_target_osds(balance_cluster_state, logger)
+        assert balance_cluster_state["upmap_queue"] == {}
+
+    def test_terminates_when_no_valid_move_exists(self, balance_cluster_state, logger):
+        # Force OSD 0 over and OSD 2 under, but block OSD 2 via failure domain.
+        # If the function failed to terminate it would hang the test runner.
+        balance_cluster_state["osd_bucket_maps"]["host"][2] = "host1"
+        coral.balance_off_target_osds(balance_cluster_state, logger)
+        assert balance_cluster_state["upmap_queue"] == {}

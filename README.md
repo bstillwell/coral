@@ -1,6 +1,6 @@
 # Coral
 
-Coral (Clyso Optimized RebALancer) is a Ceph cluster rebalancing tool. It analyzes current and future PG placement, detects OSDs whose post-backfill usage would exceed the cluster's `backfillfull_ratio`, and removes the pg_upmap_items responsible.
+Coral (Clyso Optimized RebALancer) is a Ceph cluster rebalancing tool. It analyzes current and future PG placement, compares each OSD's projected PG count against its per-pool target range, and adds pg_upmap_items that move PGs from over-target OSDs to under-target ones — honoring each pool's CRUSH rule and failure-domain constraints.
 
 ## Requirements
 
@@ -16,7 +16,7 @@ Coral (Clyso Optimized RebALancer) is a Ceph cluster rebalancing tool. It analyz
 
 | Flag | Behavior |
 |------|----------|
-| _(none)_ | Connect to the cluster, remove overfull upmaps, log to `/var/log/ceph/coral.log` |
+| _(none)_ | Connect to the cluster, add balancing upmaps, log to `/var/log/ceph/coral.log` |
 | `--preview` | Show current and future OSD usage table without modifying anything |
 | `--dry-run` | Print the `ceph osd pg-upmap-items` / `ceph osd rm-pg-upmap-items` commands that would be run |
 
@@ -26,7 +26,7 @@ Coral (Clyso Optimized RebALancer) is a Ceph cluster rebalancing tool. It analyz
 
 1. **Gather cluster state** — OSD capacity and status, PG placement (acting and up sets), pool metadata, CRUSH rules (including the set of OSDs each rule can target), and the cluster `backfillfull_ratio`. Per-OSD min/max PG targets for each pool are also derived from each OSD's CRUSH-weight share among the rule's eligible OSDs, scaled by `pg_num` and pool size.
 2. **Calculate usage** — for each OSD, sum the data it holds today (acting set) and where it will land after backfill completes (up set). Erasure-coded pools distribute `num_bytes / k` per OSD; replica pools distribute the full `num_bytes`.
-3. **Remove overfull upmaps** — any OSD whose projected usage meets or exceeds `backfillfull_ratio` has the upmap redirections sending data to it removed, then usage is recalculated.
+3. **Balance off-target OSDs** — for each pool, the most over-target OSD has one of its PGs redirected (via a new `pg-upmap-items` entry) to the most under-target OSD that the pool's CRUSH rule allows and that doesn't collide on failure domain with the PG's other replicas. Repeats until no valid moves remain for the pool.
 4. **Apply changes** — the queued upmap modifications are sent to the MON via RADOS.
 5. **Display results** — a color-coded table shows each OSD's size, current usage, future usage, and the delta.
 
