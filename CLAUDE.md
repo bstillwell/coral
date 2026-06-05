@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Coral (Clyso Optimized RebALancer) is a Ceph cluster rebalancing tool. It analyzes cluster state, detects OSDs whose future usage would exceed the `backfillfull_ratio`, and removes pg_upmap_items that cause the overloading.
+Coral (Clyso Optimized RebALancer) is a Ceph cluster rebalancing tool. It analyzes cluster state, compares each OSD's projected PG count against its per-pool target range, and removes pg_upmap_items that push OSDs outside that range.
 
 ## Running
 
@@ -45,7 +45,9 @@ get_backfillfull_ratio() → backfillfull_ratio float
 
 `get_cluster_state()` finishes by calling `calculate_pg_distribution()`, which fills in `osds[osd_id]['target_pgs_by_pool'][pool_id] = (floor, ceil)` — the per-OSD min/max PG count for a balanced cluster, derived from the OSD's CRUSH-weight share among the pool rule's `valid_osds`, scaled by `pg_num * pool_size` (replica count or k+m). OSDs whose `crush_weight < 0.0001` are treated as zero so they don't pull a share away from the rest.
 
-After `calculate_usage()` populates `current_usage`/`future_usage` per OSD, `remove_overfull_mappings()` iteratively finds OSDs where `future_usage/size >= backfillfull_ratio` and queues removal of upmap items redirecting data to those OSDs via `queue_upmap_mapping_removal()`. Finally `apply_upmap_queue()` sends `osd pg-upmap-items` / `osd rm-pg-upmap-items` commands to the cluster.
+`calculate_usage()` populates `current_usage`/`future_usage` and per-pool PG counts (`current_pgs_by_pool` / `future_pgs_by_pool`) per OSD. `remove_off_target_mappings()` then walks every existing upmap and queues removal — via `queue_upmap_mapping_removal()` — whenever the destination OSD's `future_pgs_by_pool[pool_id]` exceeds the per-pool ceil, or the source OSD's count is below the per-pool floor. Finally `apply_upmap_queue()` sends `osd pg-upmap-items` / `osd rm-pg-upmap-items` commands to the cluster.
+
+A follow-up function will *add* new upmaps to pull OSDs that are still off-target after removal back into their per-pool range — the other half of balancing.
 
 ## RADOS Communication
 
@@ -63,4 +65,4 @@ Dry-run mode intercepts `apply_upmap_queue()` and prints the equivalent `ceph` C
 - **Replica pools**: each OSD in the acting set is credited the full `num_bytes` of the PG.
 - **Erasure-coded pools**: each OSD is credited `num_bytes / k` (k = number of data shards from the EC profile).
 
-`current_usage` is derived from the acting set; `future_usage` from the up set (where data will land after backfill completes). Overfull detection operates on `future_usage`.
+`current_usage` is derived from the acting set; `future_usage` from the up set (where data will land after backfill completes). Off-target detection operates on `future_pgs_by_pool` (PG counts on the up set) compared against `target_pgs_by_pool`.

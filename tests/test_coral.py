@@ -272,11 +272,13 @@ class TestCalculateUsage:
         coral.calculate_usage(base_cluster_state, logger)
         assert base_cluster_state["osds"][0]["current_usage"] == GiB
         assert base_cluster_state["osds"][0]["current_pgs"] == 1
+        assert base_cluster_state["osds"][0]["current_pgs_by_pool"][1] == 1
 
     def test_up_set_populates_future_usage(self, base_cluster_state, logger):
         coral.calculate_usage(base_cluster_state, logger)
         assert base_cluster_state["osds"][1]["future_usage"] == GiB
         assert base_cluster_state["osds"][1]["future_pgs"] == 1
+        assert base_cluster_state["osds"][1]["future_pgs_by_pool"][1] == 1
 
     def test_ec_pool_divides_bytes_by_k(self, logger):
         state = {
@@ -322,42 +324,53 @@ class TestCalculateUsage:
 
 class TestQueueUpmapMappingRemoval:
     def test_removes_mapping_from_pg_upmaps(self, base_cluster_state, logger):
-        base_cluster_state["osds"][1]["future_usage"] = GiB
         coral.queue_upmap_mapping_removal(base_cluster_state, "1.0", (0, 1), logger)
         assert (0, 1) not in base_cluster_state["pgs"]["1.0"]["upmaps"]
 
     def test_adds_bytes_back_to_from_osd(self, base_cluster_state, logger):
-        base_cluster_state["osds"][1]["future_usage"] = GiB
         coral.queue_upmap_mapping_removal(base_cluster_state, "1.0", (0, 1), logger)
         assert base_cluster_state["osds"][0]["future_usage"] == GiB
 
     def test_subtracts_bytes_from_to_osd(self, base_cluster_state, logger):
-        base_cluster_state["osds"][1]["future_usage"] = GiB
         coral.queue_upmap_mapping_removal(base_cluster_state, "1.0", (0, 1), logger)
         assert base_cluster_state["osds"][1]["future_usage"] == 0
+
+    def test_shifts_per_pool_pg_counts(self, base_cluster_state, logger):
+        coral.queue_upmap_mapping_removal(base_cluster_state, "1.0", (0, 1), logger)
+        assert base_cluster_state["osds"][0]["future_pgs_by_pool"][1] == 1
+        assert base_cluster_state["osds"][1]["future_pgs_by_pool"][1] == 0
 
     def test_enqueues_pgid(self, base_cluster_state, logger):
         coral.queue_upmap_mapping_removal(base_cluster_state, "1.0", (0, 1), logger)
         assert "1.0" in base_cluster_state["upmap_queue"]
 
 
-class TestRemoveOverfullMappings:
-    def test_enqueues_removal_when_osd_overfull(self, base_cluster_state, logger):
-        base_cluster_state["osds"][1]["future_usage"] = int(9.5 * GiB)  # 95% > 90%
-        coral.remove_overfull_mappings(base_cluster_state, logger)
+class TestRemoveOffTargetMappings:
+    def test_removes_upmap_when_to_osd_above_ceil(self, base_cluster_state, logger):
+        # Bump OSD 1 above its per-pool ceil so the (0, 1) upmap looks off-target
+        base_cluster_state["osds"][1]["future_pgs_by_pool"][1] = 2
+        coral.remove_off_target_mappings(base_cluster_state, logger)
         assert "1.0" in base_cluster_state["upmap_queue"]
 
-    def test_leaves_queue_empty_when_osd_underfull(self, base_cluster_state, logger):
-        base_cluster_state["osds"][1]["future_usage"] = int(8 * GiB)  # 80% < 90%
-        coral.remove_overfull_mappings(base_cluster_state, logger)
+    def test_removes_upmap_when_from_osd_below_floor(self, base_cluster_state, logger):
+        # Raise OSD 0's floor so its current count (0) lands below it
+        base_cluster_state["osds"][0]["target_pgs_by_pool"][1] = (1, 2)
+        coral.remove_off_target_mappings(base_cluster_state, logger)
+        assert "1.0" in base_cluster_state["upmap_queue"]
+
+    def test_leaves_queue_empty_when_both_osds_on_target(self, base_cluster_state, logger):
+        coral.remove_off_target_mappings(base_cluster_state, logger)
         assert "1.0" not in base_cluster_state["upmap_queue"]
 
-    def test_recalculates_usage_after_removal(self, base_cluster_state, logger):
-        base_cluster_state["osds"][1]["future_usage"] = int(9.5 * GiB)
-        coral.remove_overfull_mappings(base_cluster_state, logger)
-        assert base_cluster_state["osds"][0]["future_usage"] == GiB
+    def test_recalculates_counts_after_removal(self, base_cluster_state, logger):
+        base_cluster_state["osds"][1]["future_pgs_by_pool"][1] = 2
+        coral.remove_off_target_mappings(base_cluster_state, logger)
+        assert base_cluster_state["osds"][0]["future_pgs_by_pool"][1] == 1
+        assert base_cluster_state["osds"][1]["future_pgs_by_pool"][1] == 1
 
-    def test_skips_zero_size_osd(self, base_cluster_state, logger):
-        base_cluster_state["osds"][1]["size"] = 0
-        base_cluster_state["osds"][1]["future_usage"] = GiB
-        coral.remove_overfull_mappings(base_cluster_state, logger)  # must not raise ZeroDivisionError
+    def test_handles_osd_missing_from_target_map(self, base_cluster_state, logger):
+        # OSD with no target entry for the pool is treated as (0, 0); OSD 1 then
+        # has count=1 > ceil=0, triggering removal
+        base_cluster_state["osds"][1]["target_pgs_by_pool"] = {}
+        coral.remove_off_target_mappings(base_cluster_state, logger)
+        assert "1.0" in base_cluster_state["upmap_queue"]
