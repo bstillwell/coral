@@ -42,8 +42,8 @@ def main():
     # Calculate future OSD usage based on the 'up' set
     calculate_usage(cluster_state, logger)
 
-    # Try and remove upmap mappings that are causing OSDs to exceed the backfillfull_ratio
-    remove_overfull_mappings(cluster_state, logger)
+    # Remove upmap mappings that push OSDs outside their per-pool target range
+    remove_off_target_mappings(cluster_state, logger)
 
     # Apply the changes we determined were needed
     apply_upmap_queue(cluster, cluster_state, is_dryrun, logger)
@@ -368,8 +368,10 @@ def calculate_usage(cluster_state, logger):
     for osd in cluster_state['osds']:
         cluster_state['osds'][osd]['current_usage'] = 0
         cluster_state['osds'][osd]['current_pgs'] = 0
+        cluster_state['osds'][osd]['current_pgs_by_pool'] = {}
         cluster_state['osds'][osd]['future_usage'] = 0
         cluster_state['osds'][osd]['future_pgs'] = 0
+        cluster_state['osds'][osd]['future_pgs_by_pool'] = {}
 
     for pool in cluster_state['pools']:
         if cluster_state['pools'][pool]['type'] == 'replica':
@@ -392,6 +394,8 @@ def calculate_usage(cluster_state, logger):
                 else:
                     cluster_state['osds'][osd]['current_usage'] += cluster_state['pgs'][pg]['num_bytes'] / cluster_state['pools'][pool]['k']
                 cluster_state['osds'][osd]['current_pgs'] += 1
+                cluster_state['osds'][osd]['current_pgs_by_pool'][pool] = \
+                    cluster_state['osds'][osd]['current_pgs_by_pool'].get(pool, 0) + 1
 
             # Calculate future usage
             for osd in cluster_state['pgs'][pg]['up']:
@@ -404,38 +408,45 @@ def calculate_usage(cluster_state, logger):
                 else:
                     cluster_state['osds'][osd]['future_usage'] += cluster_state['pgs'][pg]['num_bytes'] / cluster_state['pools'][pool]['k']
                 cluster_state['osds'][osd]['future_pgs'] += 1
+                cluster_state['osds'][osd]['future_pgs_by_pool'][pool] = \
+                    cluster_state['osds'][osd]['future_pgs_by_pool'].get(pool, 0) + 1
 
 def queue_upmap_mapping_removal(cluster_state, pgid, mapping, logger):
     logger.debug(f"Queueing upmap mapping removal for {pgid}: Removing {mapping} from {cluster_state['pgs'][pgid]['upmaps']}")
 
     from_osd, to_osd = mapping
+    pool_id = int(pgid.split('.')[0])
     cluster_state['pgs'][pgid]['upmaps'].remove(mapping)
     cluster_state['osds'][from_osd]['future_usage'] += cluster_state['pgs'][pgid]['num_bytes']
     cluster_state['osds'][from_osd]['future_pgs'] += 1
+    cluster_state['osds'][from_osd]['future_pgs_by_pool'][pool_id] = \
+        cluster_state['osds'][from_osd]['future_pgs_by_pool'].get(pool_id, 0) + 1
     cluster_state['osds'][to_osd]['future_usage'] -= cluster_state['pgs'][pgid]['num_bytes']
     cluster_state['osds'][to_osd]['future_pgs'] -= 1
+    cluster_state['osds'][to_osd]['future_pgs_by_pool'][pool_id] = \
+        cluster_state['osds'][to_osd]['future_pgs_by_pool'].get(pool_id, 0) - 1
     cluster_state['upmap_queue'][pgid] = cluster_state['pgs'][pgid]['upmaps']
 
-def remove_overfull_mappings(cluster_state, logger):
-    logger.debug("Scanning for OSDs exceeding backfillfull_ratio due to upmaps")
+def remove_off_target_mappings(cluster_state, logger):
+    logger.debug("Scanning for upmaps causing OSDs to be off-target for their pool")
 
-    backfillfull_ratio = cluster_state['backfillfull_ratio']
+    osds = cluster_state['osds']
 
-    for osd_id, osd_info in cluster_state['osds'].items():
-        if osd_info['size'] == 0:
-            continue
-        future_pct = osd_info['future_usage'] / osd_info['size']
-        if future_pct >= backfillfull_ratio:
-            logger.info(f"osd.{osd_id} exceeds the backfillfull_ratio ({future_pct} > {backfillfull_ratio}")
+    for pgid, pg_info in cluster_state['pgs'].items():
+        pool_id = int(pgid.split('.')[0])
+        for from_osd, to_osd in list(pg_info['upmaps']):
+            to_ceil = osds[to_osd]['target_pgs_by_pool'].get(pool_id, (0, 0))[1]
+            from_floor = osds[from_osd]['target_pgs_by_pool'].get(pool_id, (0, 0))[0]
+            to_count = osds[to_osd]['future_pgs_by_pool'].get(pool_id, 0)
+            from_count = osds[from_osd]['future_pgs_by_pool'].get(pool_id, 0)
 
-            for pgid, pg_info in cluster_state['pgs'].items():
-                for from_osd, to_osd in pg_info['upmaps']:
-                    if to_osd == osd_id:
-                        queue_upmap_mapping_removal(cluster_state, pgid, (from_osd, to_osd), logger)
-                        future_pct = osd_info['future_usage'] / osd_info['size']
-                        continue
-                if future_pct < backfillfull_ratio:
-                    break
+            if to_count > to_ceil or from_count < from_floor:
+                logger.info(
+                    f"Removing off-target upmap {pgid}: ({from_osd} -> {to_osd}) "
+                    f"[to_count={to_count}/ceil={to_ceil}, "
+                    f"from_count={from_count}/floor={from_floor}]"
+                )
+                queue_upmap_mapping_removal(cluster_state, pgid, (from_osd, to_osd), logger)
 
 def apply_upmap_queue(cluster, cluster_state, is_dryrun, logger):
     logger.debug("Applying upmap changes")

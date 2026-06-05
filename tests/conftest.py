@@ -120,8 +120,26 @@ def logger():
 def base_cluster_state():
     return {
         "osds": {
-            0: {"size": 10 * GiB, "current_usage": 0, "current_pgs": 0, "future_usage": 0, "future_pgs": 0},
-            1: {"size": 10 * GiB, "current_usage": 0, "current_pgs": 0, "future_usage": 0, "future_pgs": 0},
+            0: {
+                "size": 10 * GiB,
+                "current_usage": 0,
+                "current_pgs": 1,
+                "current_pgs_by_pool": {1: 1},
+                "future_usage": 0,
+                "future_pgs": 0,
+                "future_pgs_by_pool": {1: 0},
+                "target_pgs_by_pool": {1: (0, 1)},
+            },
+            1: {
+                "size": 10 * GiB,
+                "current_usage": 0,
+                "current_pgs": 0,
+                "current_pgs_by_pool": {1: 0},
+                "future_usage": GiB,
+                "future_pgs": 1,
+                "future_pgs_by_pool": {1: 1},
+                "target_pgs_by_pool": {1: (0, 1)},
+            },
         },
         "pgs": {
             "1.0": {
