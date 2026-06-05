@@ -181,9 +181,13 @@ class TestGetOsdBucketMaps:
 
 class TestCalculatePgDistribution:
     @staticmethod
-    def _state(osd_weights, pools, valid_osds):
+    def _state(osd_weights, pools, valid_osds, in_status=None):
+        in_status = in_status or {}
         return {
-            "osds": {osd_id: {"crush_weight": w} for osd_id, w in osd_weights.items()},
+            "osds": {
+                osd_id: {"crush_weight": w, "in": in_status.get(osd_id, 1)}
+                for osd_id, w in osd_weights.items()
+            },
             "pools": pools,
             "crush_rules": {0: {"name": "r", "steps": [], "valid_osds": valid_osds}},
         }
@@ -260,6 +264,20 @@ class TestCalculatePgDistribution:
         coral.calculate_pg_distribution(state, logger)
         assert state["osds"][0]["target_pgs_by_pool"][1] == (0, 0)
         assert state["osds"][1]["target_pgs_by_pool"][1] == (0, 0)
+
+    def test_out_osd_gets_zero_target_and_doesnt_pull_share(self, logger):
+        # OSD 2 is OUT — its weight must not be counted in total_weight, so
+        # OSDs 0 and 1 split the full pool share between themselves.
+        state = self._state(
+            {0: 1.0, 1: 1.0, 2: 1.0},
+            {1: {"crush_rule": 0, "pgs": 128, "size": 3}},
+            valid_osds=[0, 1, 2],
+            in_status={0: 1, 1: 1, 2: 0},
+        )
+        coral.calculate_pg_distribution(state, logger)
+        assert state["osds"][2]["target_pgs_by_pool"][1] == (0, 0)
+        assert state["osds"][0]["target_pgs_by_pool"][1] == (192, 192)
+        assert state["osds"][1]["target_pgs_by_pool"][1] == (192, 192)
 
     def test_invoked_by_get_cluster_state(self, mock_cluster, logger):
         state = coral.get_cluster_state(mock_cluster, logger)

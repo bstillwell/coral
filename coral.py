@@ -346,11 +346,16 @@ def calculate_pg_distribution(cluster_state, logger):
     for pool_id, pool in cluster_state['pools'].items():
         valid_osds = cluster_state['crush_rules'][pool['crush_rule']]['valid_osds']
 
-        # Treat negligible-weight OSDs as zero so they neither receive PGs nor
-        # affect the proportions for the rest
+        # Treat OSDs that are marked OUT, or that have a negligible CRUSH
+        # weight, as zero so they neither receive PGs nor pull share away from
+        # the in-cluster OSDs that will actually host the data.
         weights = {}
         for osd_id in valid_osds:
-            w = cluster_state['osds'][osd_id]['crush_weight']
+            osd = cluster_state['osds'][osd_id]
+            if not osd.get('in'):
+                weights[osd_id] = 0.0
+                continue
+            w = osd['crush_weight']
             weights[osd_id] = w if w >= 0.0001 else 0.0
         total_weight = sum(weights.values())
 
