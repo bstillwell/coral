@@ -497,7 +497,6 @@ def balance_off_target_osds(cluster_state, logger):
             if not over:
                 break
             over.sort(reverse=True)
-            _, from_osd = over[0]
 
             under = []
             for osd_id in valid_osds:
@@ -511,28 +510,31 @@ def balance_off_target_osds(cluster_state, logger):
             destinations = [osd_id for _, osd_id in under]
 
             made_move = False
-            for pgid, pg in cluster_state['pgs'].items():
-                if not pgid.startswith(f"{pool_id}."):
-                    continue
-                if from_osd not in pg['up']:
-                    continue
-                for to_osd in destinations:
-                    if to_osd in pg['up']:
+            for _, from_osd in over:
+                for pgid, pg in cluster_state['pgs'].items():
+                    if not pgid.startswith(f"{pool_id}."):
                         continue
-                    to_bucket = bucket_map.get(to_osd)
-                    peer_buckets = {
-                        bucket_map.get(o) for o in pg['up']
-                        if o != from_osd and o != CRUSH_ITEM_NONE
-                    }
-                    if to_bucket in peer_buckets:
+                    if from_osd not in pg['up']:
                         continue
-                    logger.info(
-                        f"Adding balancing upmap {pgid}: ({from_osd} -> {to_osd}) "
-                        f"[pool={pool_id}]"
-                    )
-                    queue_upmap_mapping_addition(cluster_state, pgid, (from_osd, to_osd), logger)
-                    made_move = True
-                    break
+                    for to_osd in destinations:
+                        if to_osd in pg['up']:
+                            continue
+                        to_bucket = bucket_map.get(to_osd)
+                        peer_buckets = {
+                            bucket_map.get(o) for o in pg['up']
+                            if o != from_osd and o != CRUSH_ITEM_NONE
+                        }
+                        if to_bucket in peer_buckets:
+                            continue
+                        logger.info(
+                            f"Adding balancing upmap {pgid}: ({from_osd} -> {to_osd}) "
+                            f"[pool={pool_id}]"
+                        )
+                        queue_upmap_mapping_addition(cluster_state, pgid, (from_osd, to_osd), logger)
+                        made_move = True
+                        break
+                    if made_move:
+                        break
                 if made_move:
                     break
 
