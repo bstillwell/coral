@@ -681,3 +681,29 @@ class TestDisplayPgsByPool:
         coral.display_pgs_by_pool(state)
         out = capsys.readouterr().out
         assert "== OSD 0 ==" not in out
+
+    def test_pool_column_width_grows_to_longest_name(self, capsys):
+        # A mix of short and long pool names. The Pool column should size to
+        # the longest name so every row's separator " | " lands at the same
+        # column. Verify by comparing the prefix length of two data rows.
+        long_name = "default.rgw.buckets.index"
+        state = {
+            "osds": {
+                0: {
+                    "future_pgs_by_pool": {1: 0, 2: 0},
+                    "target_pgs_by_pool": {1: (0, 1), 2: (0, 1)},
+                },
+            },
+            "pools": {
+                1: {"name": "rbd"},
+                2: {"name": long_name},
+            },
+        }
+        coral.display_pgs_by_pool(state)
+        out = capsys.readouterr().out
+        # Every row's " | " separator after the pool name should align at the
+        # same column index.
+        sep_idx = [line.index(" | ") for line in out.splitlines() if " | " in line]
+        assert len(set(sep_idx)) == 1
+        # Width should be the long name's length (longer than "Pool")
+        assert sep_idx[0] == len(long_name)
