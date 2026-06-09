@@ -333,6 +333,11 @@ def get_osd_bucket_maps(cluster, logger):
             # We only care about OSDs, so skip the others
             if node.get('type') != 'osd':
                 continue
+            # An OSD-level failure domain treats each OSD as its own bucket —
+            # there's no enclosing 'osd' ancestor to walk up to.
+            if failure_domain_type == 'osd':
+                m[node['id']] = node['name']
+                continue
             cur = node['id']
             while cur in parent_of:
                 pid = parent_of[cur]
