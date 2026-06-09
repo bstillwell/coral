@@ -428,12 +428,17 @@ def queue_upmap_mapping_removal(cluster_state, pgid, mapping, logger):
 
     from_osd, to_osd = mapping
     pool_id = int(pgid.split('.')[0])
+    pool = cluster_state['pools'][pool_id]
+    num_bytes = cluster_state['pgs'][pgid]['num_bytes']
+    # Each EC shard only holds num_bytes / k; replica shards hold the full PG
+    per_osd_bytes = num_bytes if pool['type'] == 'replica' else num_bytes / pool['k']
+
     cluster_state['pgs'][pgid]['upmaps'].remove(mapping)
-    cluster_state['osds'][from_osd]['future_usage'] += cluster_state['pgs'][pgid]['num_bytes']
+    cluster_state['osds'][from_osd]['future_usage'] += per_osd_bytes
     cluster_state['osds'][from_osd]['future_pgs'] += 1
     cluster_state['osds'][from_osd]['future_pgs_by_pool'][pool_id] = \
         cluster_state['osds'][from_osd]['future_pgs_by_pool'].get(pool_id, 0) + 1
-    cluster_state['osds'][to_osd]['future_usage'] -= cluster_state['pgs'][pgid]['num_bytes']
+    cluster_state['osds'][to_osd]['future_usage'] -= per_osd_bytes
     cluster_state['osds'][to_osd]['future_pgs'] -= 1
     cluster_state['osds'][to_osd]['future_pgs_by_pool'][pool_id] = \
         cluster_state['osds'][to_osd]['future_pgs_by_pool'].get(pool_id, 0) - 1
@@ -482,6 +487,11 @@ def queue_upmap_mapping_addition(cluster_state, pgid, mapping, logger):
 
     from_osd, to_osd = mapping
     pool_id = int(pgid.split('.')[0])
+    pool = cluster_state['pools'][pool_id]
+    num_bytes = cluster_state['pgs'][pgid]['num_bytes']
+    # Each EC shard only holds num_bytes / k; replica shards hold the full PG
+    per_osd_bytes = num_bytes if pool['type'] == 'replica' else num_bytes / pool['k']
+
     cluster_state['pgs'][pgid]['upmaps'].append(mapping)
 
     # Reflect the new placement in the up set so subsequent iterations see it
@@ -491,11 +501,11 @@ def queue_upmap_mapping_addition(cluster_state, pgid, mapping, logger):
             up[i] = to_osd
             break
 
-    cluster_state['osds'][from_osd]['future_usage'] -= cluster_state['pgs'][pgid]['num_bytes']
+    cluster_state['osds'][from_osd]['future_usage'] -= per_osd_bytes
     cluster_state['osds'][from_osd]['future_pgs'] -= 1
     cluster_state['osds'][from_osd]['future_pgs_by_pool'][pool_id] = \
         cluster_state['osds'][from_osd]['future_pgs_by_pool'].get(pool_id, 0) - 1
-    cluster_state['osds'][to_osd]['future_usage'] += cluster_state['pgs'][pgid]['num_bytes']
+    cluster_state['osds'][to_osd]['future_usage'] += per_osd_bytes
     cluster_state['osds'][to_osd]['future_pgs'] += 1
     cluster_state['osds'][to_osd]['future_pgs_by_pool'][pool_id] = \
         cluster_state['osds'][to_osd]['future_pgs_by_pool'].get(pool_id, 0) + 1

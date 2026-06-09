@@ -362,6 +362,25 @@ class TestQueueUpmapMappingRemoval:
         coral.queue_upmap_mapping_removal(base_cluster_state, "1.0", (0, 1), logger)
         assert "1.0" in base_cluster_state["upmap_queue"]
 
+    def test_ec_pool_shifts_per_shard_bytes_not_full_pg(self, logger):
+        # EC pool with k=4: each OSD's shard is num_bytes / 4, not num_bytes.
+        state = {
+            "osds": {
+                0: {"size": 10 * GiB, "future_usage": 0, "future_pgs": 0, "future_pgs_by_pool": {2: 0}},
+                1: {"size": 10 * GiB, "future_usage": GiB, "future_pgs": 1, "future_pgs_by_pool": {2: 1}},
+            },
+            "pgs": {
+                "2.0": {"up": [1], "acting": [0], "num_bytes": 4 * GiB, "upmaps": [(0, 1)]}
+            },
+            "pools": {
+                2: {"name": "ecpool", "type": "erasure", "crush_rule": 0, "pgs": 1, "size": 6, "k": 4, "m": 2}
+            },
+            "upmap_queue": {},
+        }
+        coral.queue_upmap_mapping_removal(state, "2.0", (0, 1), logger)
+        assert state["osds"][0]["future_usage"] == GiB  # 4 GiB / k=4
+        assert state["osds"][1]["future_usage"] == 0
+
 
 class TestRemoveOffTargetMappings:
     def test_removes_upmap_when_to_osd_above_ceil(self, base_cluster_state, logger):
@@ -451,6 +470,25 @@ class TestQueueUpmapMappingAddition:
     def test_enqueues_pgid(self, balance_cluster_state, logger):
         coral.queue_upmap_mapping_addition(balance_cluster_state, "1.0", (0, 2), logger)
         assert "1.0" in balance_cluster_state["upmap_queue"]
+
+    def test_ec_pool_shifts_per_shard_bytes_not_full_pg(self, logger):
+        # EC pool with k=4: each OSD's shard is num_bytes / 4, not num_bytes.
+        state = {
+            "osds": {
+                0: {"size": 10 * GiB, "future_usage": GiB, "future_pgs": 1, "future_pgs_by_pool": {2: 1}},
+                1: {"size": 10 * GiB, "future_usage": 0, "future_pgs": 0, "future_pgs_by_pool": {2: 0}},
+            },
+            "pgs": {
+                "2.0": {"up": [0], "acting": [0], "num_bytes": 4 * GiB, "upmaps": []}
+            },
+            "pools": {
+                2: {"name": "ecpool", "type": "erasure", "crush_rule": 0, "pgs": 1, "size": 6, "k": 4, "m": 2}
+            },
+            "upmap_queue": {},
+        }
+        coral.queue_upmap_mapping_addition(state, "2.0", (0, 1), logger)
+        assert state["osds"][0]["future_usage"] == 0
+        assert state["osds"][1]["future_usage"] == GiB  # 4 GiB / k=4
 
 
 class TestBalanceOffTargetOsds:
