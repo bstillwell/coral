@@ -502,7 +502,21 @@ def queue_upmap_mapping_addition(cluster_state, pgid, mapping, logger):
     # Each EC shard only holds num_bytes / k; replica shards hold the full PG
     per_osd_bytes = num_bytes if pool['type'] == 'replica' else num_bytes / pool['k']
 
-    cluster_state['pgs'][pgid]['upmaps'].append(mapping)
+    upmaps = cluster_state['pgs'][pgid]['upmaps']
+
+    # If from_osd is already the destination of an existing upmap, we'd produce
+    # an invalid set like [(X, from_osd), (from_osd, to_osd)] — Ceph rejects
+    # mappings where the same OSD appears as both source and destination.
+    # Collapse the chain X -> from_osd -> to_osd into a single X -> to_osd
+    # (or drop the upmap entirely when X == to_osd, since the redirect cancels).
+    chained = next((m for m in upmaps if m[1] == from_osd), None)
+    if chained is not None:
+        orig_from = chained[0]
+        upmaps.remove(chained)
+        if orig_from != to_osd:
+            upmaps.append((orig_from, to_osd))
+    else:
+        upmaps.append(mapping)
 
     # Reflect the new placement in the up set so subsequent iterations see it
     up = cluster_state['pgs'][pgid]['up']
