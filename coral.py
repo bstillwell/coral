@@ -51,8 +51,8 @@ def main():
     # Remove upmap mappings that pull OSDs below their per-pool target floor
     remove_under_target_mappings(cluster_state, logger)
 
-    # TODO: re-enable once the balancing strategy is refined
-    # balance_off_target_osds(cluster_state, logger)
+    # Add new upmap mappings to pull off-target OSDs into their per-pool range
+    balance_off_target_osds(cluster_state, logger)
 
     # Apply the changes we determined were needed
     apply_upmap_queue(cluster, cluster_state, is_dryrun, logger)
