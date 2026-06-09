@@ -457,6 +457,23 @@ def remove_off_target_mappings(cluster_state, logger):
                 )
                 queue_upmap_mapping_removal(cluster_state, pgid, (from_osd, to_osd), logger)
 
+def remove_under_target_mappings(cluster_state, logger):
+    logger.debug("Scanning for upmaps causing OSDs to be below their per-pool floor")
+
+    osds = cluster_state['osds']
+
+    for pgid, pg_info in cluster_state['pgs'].items():
+        pool_id = int(pgid.split('.')[0])
+        for from_osd, to_osd in list(pg_info['upmaps']):
+            from_floor = osds[from_osd]['target_pgs_by_pool'].get(pool_id, (0, 0))[0]
+            from_count = osds[from_osd]['future_pgs_by_pool'].get(pool_id, 0)
+            if from_count < from_floor:
+                logger.info(
+                    f"Removing under-target upmap {pgid}: ({from_osd} -> {to_osd}) "
+                    f"[from_count={from_count}/floor={from_floor}]"
+                )
+                queue_upmap_mapping_removal(cluster_state, pgid, (from_osd, to_osd), logger)
+
 def queue_upmap_mapping_addition(cluster_state, pgid, mapping, logger):
     logger.debug(f"Queueing upmap mapping addition for {pgid}: Adding {mapping} to {cluster_state['pgs'][pgid]['upmaps']}")
 

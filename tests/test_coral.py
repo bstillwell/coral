@@ -394,6 +394,36 @@ class TestRemoveOffTargetMappings:
         assert "1.0" in base_cluster_state["upmap_queue"]
 
 
+class TestRemoveUnderTargetMappings:
+    def test_removes_upmap_when_from_osd_below_floor(self, base_cluster_state, logger):
+        # Raise OSD 0's floor so its count (0) lands below it
+        base_cluster_state["osds"][0]["target_pgs_by_pool"][1] = (1, 2)
+        coral.remove_under_target_mappings(base_cluster_state, logger)
+        assert "1.0" in base_cluster_state["upmap_queue"]
+
+    def test_leaves_queue_empty_when_from_osd_on_floor(self, base_cluster_state, logger):
+        coral.remove_under_target_mappings(base_cluster_state, logger)
+        assert "1.0" not in base_cluster_state["upmap_queue"]
+
+    def test_ignores_to_osd_being_above_ceil(self, base_cluster_state, logger):
+        # OSD 1 over its ceil shouldn't trigger this function; only from-side counts
+        base_cluster_state["osds"][1]["future_pgs_by_pool"][1] = 5
+        coral.remove_under_target_mappings(base_cluster_state, logger)
+        assert "1.0" not in base_cluster_state["upmap_queue"]
+
+    def test_handles_osd_missing_from_target_map(self, base_cluster_state, logger):
+        # OSD 0 has no target entry — floor defaults to 0; count=0 is not below it
+        base_cluster_state["osds"][0]["target_pgs_by_pool"] = {}
+        coral.remove_under_target_mappings(base_cluster_state, logger)
+        assert "1.0" not in base_cluster_state["upmap_queue"]
+
+    def test_recalculates_counts_after_removal(self, base_cluster_state, logger):
+        base_cluster_state["osds"][0]["target_pgs_by_pool"][1] = (1, 2)
+        coral.remove_under_target_mappings(base_cluster_state, logger)
+        assert base_cluster_state["osds"][0]["future_pgs_by_pool"][1] == 1
+        assert base_cluster_state["osds"][1]["future_pgs_by_pool"][1] == 0
+
+
 class TestQueueUpmapMappingAddition:
     def test_appends_mapping_to_pg_upmaps(self, balance_cluster_state, logger):
         coral.queue_upmap_mapping_addition(balance_cluster_state, "1.0", (0, 2), logger)
