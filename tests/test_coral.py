@@ -179,6 +179,22 @@ class TestGetOsdBucketMaps:
         assert result["host"][0] == "host0"
         assert result["host"][1] == "host1"
 
+    def test_osd_failure_domain_maps_each_osd_to_itself(self, logger):
+        # A rule whose failure domain is the OSD itself must produce a
+        # populated bucket map (each OSD as its own unique bucket), not the
+        # empty dict that falls out of walking the CRUSH tree for an
+        # 'osd'-type ancestor that never exists.
+        rules = [
+            {"rule_id": 0, "rule_name": "osd_rule", "steps": [
+                {"op": "take", "item_name": "default"},
+                {"op": "chooseleaf_firstn", "num": 0, "type": "osd"},
+                {"op": "emit"},
+            ]},
+        ]
+        cluster = make_mock_cluster({"osd crush rule dump": rules})
+        result = coral.get_osd_bucket_maps(cluster, logger)
+        assert result["osd"] == {0: "osd.0", 1: "osd.1"}
+
 
 class TestCalculatePgDistribution:
     @staticmethod
@@ -543,6 +559,24 @@ class TestBalanceOffTargetOsds:
         balance_cluster_state["osd_bucket_maps"]["host"][2] = "host1"
         coral.balance_off_target_osds(balance_cluster_state, logger)
         assert balance_cluster_state["upmap_queue"] == {}
+
+    def test_pool_with_osd_failure_domain_can_balance(self, balance_cluster_state, logger):
+        # Pool's CRUSH rule has an OSD-level failure domain. Two OSDs sharing
+        # a host is fine — every OSD is its own bucket. Without the fix in
+        # get_osd_bucket_maps, the bucket_map would be empty and every
+        # candidate destination would be rejected as a failure-domain collision.
+        balance_cluster_state["crush_rules"][0]["steps"] = [
+            {"op": "take", "item_name": "default"},
+            {"op": "chooseleaf_firstn", "num": 0, "type": "osd"},
+            {"op": "emit"},
+        ]
+        balance_cluster_state["osd_bucket_maps"] = {
+            "osd": {0: "osd.0", 1: "osd.1", 2: "osd.2"},
+        }
+        # Put OSDs 1 and 2 in the same host to prove the host-level domain
+        # would have blocked this move — the osd-level domain shouldn't.
+        coral.balance_off_target_osds(balance_cluster_state, logger)
+        assert balance_cluster_state["upmap_queue"]["1.0"] == [(0, 2)]
 
     def test_at_ceil_osd_donates_to_under_target_recipient(self, balance_cluster_state, logger):
         # No OSD is over its ceil. OSD 0 is at-ceil (count=1, target (0,1))
