@@ -1,3 +1,4 @@
+import json
 from unittest.mock import MagicMock
 import pytest
 
@@ -588,3 +589,45 @@ class TestBalanceOffTargetOsds:
         assert "1.1" in state["upmap_queue"]
         assert state["upmap_queue"]["1.1"] == [(3, 2)]
         assert "1.0" not in state["upmap_queue"]
+
+
+class TestApplyUpmapQueue:
+    @staticmethod
+    def _mock_cluster():
+        cluster = MagicMock()
+        cluster.mon_command.return_value = (0, b'', b'')
+        return cluster
+
+    def test_pg_upmap_items_command_sends_integer_ids(self, logger):
+        cluster = self._mock_cluster()
+        state = {"upmap_queue": {"1.0": [(0, 1)]}}
+        coral.apply_upmap_queue(cluster, state, False, logger)
+        cmd_json = cluster.mon_command.call_args.args[0]
+        cmd = json.loads(cmd_json)
+        assert cmd == {
+            "prefix": "osd pg-upmap-items",
+            "pgid": "1.0",
+            "id": [0, 1],
+            "format": "json",
+        }
+        assert all(isinstance(i, int) for i in cmd["id"])
+
+    def test_rm_pg_upmap_items_command_for_empty_mapping(self, logger):
+        cluster = self._mock_cluster()
+        state = {"upmap_queue": {"1.0": []}}
+        coral.apply_upmap_queue(cluster, state, False, logger)
+        cmd_json = cluster.mon_command.call_args.args[0]
+        cmd = json.loads(cmd_json)
+        assert cmd == {
+            "prefix": "osd rm-pg-upmap-items",
+            "pgid": "1.0",
+            "format": "json",
+        }
+
+    def test_dryrun_prints_string_form(self, logger, capsys):
+        cluster = self._mock_cluster()
+        state = {"upmap_queue": {"1.0": [(0, 1), (2, 3)]}}
+        coral.apply_upmap_queue(cluster, state, True, logger)
+        out = capsys.readouterr().out
+        assert "ceph osd pg-upmap-items 1.0 0 1 2 3" in out
+        cluster.mon_command.assert_not_called()
