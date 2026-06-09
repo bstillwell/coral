@@ -631,3 +631,53 @@ class TestApplyUpmapQueue:
         out = capsys.readouterr().out
         assert "ceph osd pg-upmap-items 1.0 0 1 2 3" in out
         cluster.mon_command.assert_not_called()
+
+
+class TestDisplayPgsByPool:
+    def test_prints_section_per_osd(self, base_cluster_state, capsys):
+        coral.display_pgs_by_pool(base_cluster_state)
+        out = capsys.readouterr().out
+        assert "== OSD 0 ==" in out
+        assert "== OSD 1 ==" in out
+
+    def test_marks_over_target_as_over(self, base_cluster_state, capsys):
+        # OSD 1 default: future=1, ceil=1. Bump count above ceil → OVER.
+        base_cluster_state["osds"][1]["future_pgs_by_pool"][1] = 5
+        coral.display_pgs_by_pool(base_cluster_state)
+        out = capsys.readouterr().out
+        assert "OVER" in out
+
+    def test_marks_under_target_as_under(self, base_cluster_state, capsys):
+        # Raise OSD 0's floor so its count (0) lands under it
+        base_cluster_state["osds"][0]["target_pgs_by_pool"][1] = (2, 3)
+        coral.display_pgs_by_pool(base_cluster_state)
+        out = capsys.readouterr().out
+        assert "UNDER" in out
+
+    def test_marks_on_target_as_ok(self, base_cluster_state, capsys):
+        coral.display_pgs_by_pool(base_cluster_state)
+        out = capsys.readouterr().out
+        assert "OK" in out
+        assert "OVER" not in out
+        assert "UNDER" not in out
+
+    def test_shows_floor_ceil_and_future_count(self, base_cluster_state, capsys):
+        coral.display_pgs_by_pool(base_cluster_state)
+        out = capsys.readouterr().out
+        # Header columns
+        assert "Future PGs" in out
+        assert "Floor" in out
+        assert "Ceil" in out
+        # Pool name from fixture
+        assert "rbd" in out
+
+    def test_skips_osd_with_no_pool_entries(self, capsys):
+        state = {
+            "osds": {
+                0: {"future_pgs_by_pool": {}, "target_pgs_by_pool": {}},
+            },
+            "pools": {},
+        }
+        coral.display_pgs_by_pool(state)
+        out = capsys.readouterr().out
+        assert "== OSD 0 ==" not in out

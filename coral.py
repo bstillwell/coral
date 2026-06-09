@@ -23,6 +23,8 @@ def main():
                         help="Show the future cluster state")
     parser.add_argument('--dry-run', action='store_true',
                         help="Don't modify the pg upmaps, print out the pg-upmap-items commands instead")
+    parser.add_argument('--preview-pgs', action='store_true',
+                        help="After the usage table, print a per-OSD breakdown of future PGs by pool with their target floor/ceil")
     args = parser.parse_args()
 
     is_preview = args.preview
@@ -57,6 +59,9 @@ def main():
 
     # Provide a nice display of current and future OSD usage
     display_usage(cluster_state)
+
+    if args.preview_pgs:
+        display_pgs_by_pool(cluster_state)
 
     # Disconnect from the cluster
     logger.debug("Disconnecting from Ceph cluster")
@@ -657,6 +662,37 @@ def display_usage(cluster_state):
         osd_stat_strings.append(f"{change_usage_gb:+5.1f} GiB  {change_usage_pct:+6.1f}%  {change_pgs:+3} PGs")
 
         print(" | ".join(osd_stat_strings))
+
+def display_pgs_by_pool(cluster_state):
+    # For each OSD, print a small table showing the future PG count, target
+    # floor/ceil, and status (OVER/UNDER/OK) per pool. Pools where the OSD
+    # has neither a target entry nor any future PGs are skipped.
+    for osd_id in cluster_state['osds']:
+        osd = cluster_state['osds'][osd_id]
+        target_by_pool = osd.get('target_pgs_by_pool', {})
+        future_by_pool = osd.get('future_pgs_by_pool', {})
+        pool_ids = sorted(set(target_by_pool) | set(future_by_pool))
+        if not pool_ids:
+            continue
+
+        print()
+        print(f"== OSD {osd_id} ==")
+        print("Pool                 | Future PGs | Floor | Ceil | Status")
+        print("---------------------+------------+-------+------+--------")
+
+        for pool_id in pool_ids:
+            pool_name = cluster_state['pools'].get(pool_id, {}).get('name', f"pool_{pool_id}")
+            future_pgs = future_by_pool.get(pool_id, 0)
+            floor, ceil = target_by_pool.get(pool_id, (0, 0))
+
+            if future_pgs > ceil:
+                status = f"{RED}OVER{RESET}"
+            elif future_pgs < floor:
+                status = f"{YELLOW}UNDER{RESET}"
+            else:
+                status = f"{GREEN}OK{RESET}"
+
+            print(f"{pool_name:<20} | {future_pgs:>10} | {floor:>5} | {ceil:>4} | {status}")
 
 if __name__ == '__main__':
     main()
