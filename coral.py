@@ -46,6 +46,9 @@ def main():
     # the total upmap mapping count
     # remove_off_target_mappings(cluster_state, logger)
 
+    # Remove upmap mappings that pull OSDs below their per-pool target floor
+    remove_under_target_mappings(cluster_state, logger)
+
     # TODO: re-enable once the balancing strategy is refined
     # balance_off_target_osds(cluster_state, logger)
 
