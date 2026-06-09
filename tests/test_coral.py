@@ -544,6 +544,21 @@ class TestBalanceOffTargetOsds:
         coral.balance_off_target_osds(balance_cluster_state, logger)
         assert balance_cluster_state["upmap_queue"] == {}
 
+    def test_at_ceil_osd_donates_to_under_target_recipient(self, balance_cluster_state, logger):
+        # No OSD is over its ceil. OSD 0 is at-ceil (count=1, target (0,1))
+        # with a PG to spare since count > floor. OSD 1 is at-floor (count=1,
+        # target (1,2)) so it cannot donate. OSD 2 is under (count=0, target
+        # (1,1)). The function must treat at-ceil OSDs as donors when their
+        # count is strictly above floor — without that, no donor is found and
+        # the under-target OSD never receives a PG.
+        balance_cluster_state["osds"][0]["target_pgs_by_pool"][1] = (0, 1)  # count=1, at ceil → donor
+        balance_cluster_state["osds"][1]["target_pgs_by_pool"][1] = (1, 2)  # count=1, at floor → NOT donor
+        balance_cluster_state["osds"][2]["target_pgs_by_pool"][1] = (1, 1)  # count=0, under   → recipient
+        coral.balance_off_target_osds(balance_cluster_state, logger)
+        assert balance_cluster_state["upmap_queue"]["1.0"] == [(0, 2)]
+        assert balance_cluster_state["osds"][0]["future_pgs_by_pool"][1] == 0
+        assert balance_cluster_state["osds"][2]["future_pgs_by_pool"][1] == 1
+
     def test_falls_back_to_next_over_target_osd_when_top_cannot_move(self, logger):
         # OSD 0 is the most over-target (excess 2) but its only PG (1.0) can't
         # move to OSD 2 — OSD 2 shares OSD 1's bucket, blocking the placement.
