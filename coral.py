@@ -667,6 +667,22 @@ def display_pgs_by_pool(cluster_state):
     # For each OSD, print a small table showing the future PG count, target
     # floor/ceil, and status (OVER/UNDER/OK) per pool. Pools where the OSD
     # has neither a target entry nor any future PGs are skipped.
+
+    # Size the Pool column to the longest pool name so output stays aligned
+    # across OSD sections, even with mixed-length names like ".mgr" and
+    # "default.rgw.buckets.index".
+    def _pool_name(pool_id):
+        return cluster_state['pools'].get(pool_id, {}).get('name', f"pool_{pool_id}")
+
+    pool_ids_used = set()
+    for osd in cluster_state['osds'].values():
+        pool_ids_used.update(osd.get('target_pgs_by_pool', {}))
+        pool_ids_used.update(osd.get('future_pgs_by_pool', {}))
+    pool_col_width = max([len("Pool")] + [len(_pool_name(p)) for p in pool_ids_used])
+
+    header = f"{'Pool':<{pool_col_width}} | Future PGs | Floor | Ceil | Status"
+    separator = f"{'-' * pool_col_width}-+------------+-------+------+--------"
+
     for osd_id in cluster_state['osds']:
         osd = cluster_state['osds'][osd_id]
         target_by_pool = osd.get('target_pgs_by_pool', {})
@@ -677,11 +693,11 @@ def display_pgs_by_pool(cluster_state):
 
         print()
         print(f"== OSD {osd_id} ==")
-        print("Pool                 | Future PGs | Floor | Ceil | Status")
-        print("---------------------+------------+-------+------+--------")
+        print(header)
+        print(separator)
 
         for pool_id in pool_ids:
-            pool_name = cluster_state['pools'].get(pool_id, {}).get('name', f"pool_{pool_id}")
+            pool_name = _pool_name(pool_id)
             future_pgs = future_by_pool.get(pool_id, 0)
             floor, ceil = target_by_pool.get(pool_id, (0, 0))
 
@@ -692,7 +708,7 @@ def display_pgs_by_pool(cluster_state):
             else:
                 status = f"{GREEN}OK{RESET}"
 
-            print(f"{pool_name:<20} | {future_pgs:>10} | {floor:>5} | {ceil:>4} | {status}")
+            print(f"{pool_name:<{pool_col_width}} | {future_pgs:>10} | {floor:>5} | {ceil:>4} | {status}")
 
 if __name__ == '__main__':
     main()
