@@ -590,9 +590,9 @@ def apply_upmap_queue(cluster, cluster_state, is_dryrun, logger):
                 cmd = {'prefix': 'osd rm-pg-upmap-items', 'pgid': pgid, 'format': 'json'}
                 ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
         else:
-            mappings_list = [str(item) for osd in mappings for item in osd]
+            mappings_list = [item for pair in mappings for item in pair]
             if is_dryrun:
-                print(f"ceph osd pg-upmap-items {pgid} {' '.join(mappings_list)}")
+                print(f"ceph osd pg-upmap-items {pgid} {' '.join(str(i) for i in mappings_list)}")
             else:
                 logger.info(f"Applying upmap items for {pgid}: {mappings}")
                 cmd = {'prefix': 'osd pg-upmap-items', 'pgid': pgid, 'id': mappings_list, 'format': 'json'}
