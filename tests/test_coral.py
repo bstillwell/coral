@@ -507,6 +507,30 @@ class TestQueueUpmapMappingAddition:
         assert state["osds"][0]["future_usage"] == 0
         assert state["osds"][1]["future_usage"] == GiB  # 4 GiB / k=4
 
+    def test_collapses_chain_when_from_osd_is_existing_destination(self, balance_cluster_state, logger):
+        # Existing upmap (1, 0) redirects to OSD 0. Adding (0, 2) on the same
+        # PG would produce the invalid set [(1, 0), (0, 2)] — OSD 0 is both a
+        # destination and a source. The helper must collapse the chain into
+        # the single upmap (1, 2).
+        balance_cluster_state["pgs"]["1.0"]["upmaps"] = [(1, 0)]
+        coral.queue_upmap_mapping_addition(balance_cluster_state, "1.0", (0, 2), logger)
+        assert balance_cluster_state["pgs"]["1.0"]["upmaps"] == [(1, 2)]
+
+    def test_collapses_chain_to_noop_when_round_trip(self, balance_cluster_state, logger):
+        # Chain 2 -> 0 -> 2 round-trips; the upmap should be dropped entirely
+        # rather than written as the self-loop (2, 2).
+        balance_cluster_state["pgs"]["1.0"]["upmaps"] = [(2, 0)]
+        coral.queue_upmap_mapping_addition(balance_cluster_state, "1.0", (0, 2), logger)
+        assert balance_cluster_state["pgs"]["1.0"]["upmaps"] == []
+
+    def test_unrelated_existing_upmaps_are_preserved(self, balance_cluster_state, logger):
+        # An existing upmap whose destination is NOT the new from_osd should
+        # remain untouched alongside the newly appended mapping.
+        balance_cluster_state["pgs"]["1.0"]["upmaps"] = [(1, 99)]
+        coral.queue_upmap_mapping_addition(balance_cluster_state, "1.0", (0, 2), logger)
+        assert (1, 99) in balance_cluster_state["pgs"]["1.0"]["upmaps"]
+        assert (0, 2) in balance_cluster_state["pgs"]["1.0"]["upmaps"]
+
 
 class TestBalanceOffTargetOsds:
     def test_queues_upmap_when_osd_over_and_destination_available(self, balance_cluster_state, logger):
