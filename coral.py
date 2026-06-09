@@ -528,16 +528,7 @@ def balance_off_target_osds(cluster_state, logger):
         bucket_map = cluster_state['osd_bucket_maps'].get(failure_domain, {})
 
         while True:
-            over = []
-            for osd_id in valid_osds:
-                ceil = osds[osd_id]['target_pgs_by_pool'].get(pool_id, (0, 0))[1]
-                count = osds[osd_id]['future_pgs_by_pool'].get(pool_id, 0)
-                if count > ceil:
-                    over.append((count - ceil, osd_id))
-            if not over:
-                break
-            over.sort(reverse=True)
-
+            # Recipients: OSDs strictly below their per-pool floor
             under = []
             for osd_id in valid_osds:
                 floor = osds[osd_id]['target_pgs_by_pool'].get(pool_id, (0, 0))[0]
@@ -549,8 +540,21 @@ def balance_off_target_osds(cluster_state, logger):
             under.sort(reverse=True)
             destinations = [osd_id for _, osd_id in under]
 
+            # Donors: OSDs whose count is strictly above their floor, so
+            # donating one PG keeps them within range. Over-ceil OSDs (largest
+            # excess above floor) naturally sort first.
+            donors = []
+            for osd_id in valid_osds:
+                floor = osds[osd_id]['target_pgs_by_pool'].get(pool_id, (0, 0))[0]
+                count = osds[osd_id]['future_pgs_by_pool'].get(pool_id, 0)
+                if count > floor:
+                    donors.append((count - floor, osd_id))
+            if not donors:
+                break
+            donors.sort(reverse=True)
+
             made_move = False
-            for _, from_osd in over:
+            for _, from_osd in donors:
                 for pgid, pg in cluster_state['pgs'].items():
                     if not pgid.startswith(f"{pool_id}."):
                         continue
