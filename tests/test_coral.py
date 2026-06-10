@@ -399,37 +399,6 @@ class TestQueueUpmapMappingRemoval:
         assert state["osds"][1]["future_usage"] == 0
 
 
-class TestRemoveOffTargetMappings:
-    def test_removes_upmap_when_to_osd_above_ceil(self, base_cluster_state, logger):
-        # Bump OSD 1 above its per-pool ceil so the (0, 1) upmap looks off-target
-        base_cluster_state["osds"][1]["future_pgs_by_pool"][1] = 2
-        coral.remove_off_target_mappings(base_cluster_state, logger)
-        assert "1.0" in base_cluster_state["upmap_queue"]
-
-    def test_removes_upmap_when_from_osd_below_floor(self, base_cluster_state, logger):
-        # Raise OSD 0's floor so its current count (0) lands below it
-        base_cluster_state["osds"][0]["target_pgs_by_pool"][1] = (1, 2)
-        coral.remove_off_target_mappings(base_cluster_state, logger)
-        assert "1.0" in base_cluster_state["upmap_queue"]
-
-    def test_leaves_queue_empty_when_both_osds_on_target(self, base_cluster_state, logger):
-        coral.remove_off_target_mappings(base_cluster_state, logger)
-        assert "1.0" not in base_cluster_state["upmap_queue"]
-
-    def test_recalculates_counts_after_removal(self, base_cluster_state, logger):
-        base_cluster_state["osds"][1]["future_pgs_by_pool"][1] = 2
-        coral.remove_off_target_mappings(base_cluster_state, logger)
-        assert base_cluster_state["osds"][0]["future_pgs_by_pool"][1] == 1
-        assert base_cluster_state["osds"][1]["future_pgs_by_pool"][1] == 1
-
-    def test_handles_osd_missing_from_target_map(self, base_cluster_state, logger):
-        # OSD with no target entry for the pool is treated as (0, 0); OSD 1 then
-        # has count=1 > ceil=0, triggering removal
-        base_cluster_state["osds"][1]["target_pgs_by_pool"] = {}
-        coral.remove_off_target_mappings(base_cluster_state, logger)
-        assert "1.0" in base_cluster_state["upmap_queue"]
-
-
 class TestRemoveUnderTargetMappings:
     def test_removes_upmap_when_from_osd_below_floor(self, base_cluster_state, logger):
         # Raise OSD 0's floor so its count (0) lands below it

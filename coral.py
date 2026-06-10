@@ -48,10 +48,6 @@ def main():
     # displayed current/future state reflects only what the cluster will do on
     # its own from existing PG up/acting sets.
     if not is_preview:
-        # TODO: re-enable once remove_off_target_mappings is rewritten to reduce
-        # the total upmap mapping count
-        # remove_off_target_mappings(cluster_state, logger)
-
         # Remove upmap mappings that pull OSDs below their per-pool target floor
         remove_under_target_mappings(cluster_state, logger)
 
@@ -457,27 +453,6 @@ def queue_upmap_mapping_removal(cluster_state, pgid, mapping, logger):
     cluster_state['osds'][to_osd]['future_pgs_by_pool'][pool_id] = \
         cluster_state['osds'][to_osd]['future_pgs_by_pool'].get(pool_id, 0) - 1
     cluster_state['upmap_queue'][pgid] = cluster_state['pgs'][pgid]['upmaps']
-
-def remove_off_target_mappings(cluster_state, logger):
-    logger.debug("Scanning for upmaps causing OSDs to be off-target for their pool")
-
-    osds = cluster_state['osds']
-
-    for pgid, pg_info in cluster_state['pgs'].items():
-        pool_id = int(pgid.split('.')[0])
-        for from_osd, to_osd in list(pg_info['upmaps']):
-            to_ceil = osds[to_osd]['target_pgs_by_pool'].get(pool_id, (0, 0))[1]
-            from_floor = osds[from_osd]['target_pgs_by_pool'].get(pool_id, (0, 0))[0]
-            to_count = osds[to_osd]['future_pgs_by_pool'].get(pool_id, 0)
-            from_count = osds[from_osd]['future_pgs_by_pool'].get(pool_id, 0)
-
-            if to_count > to_ceil or from_count < from_floor:
-                logger.info(
-                    f"Removing off-target upmap {pgid}: ({from_osd} -> {to_osd}) "
-                    f"[to_count={to_count}/ceil={to_ceil}, "
-                    f"from_count={from_count}/floor={from_floor}]"
-                )
-                queue_upmap_mapping_removal(cluster_state, pgid, (from_osd, to_osd), logger)
 
 def remove_under_target_mappings(cluster_state, logger):
     logger.debug("Scanning for upmaps causing OSDs to be below their per-pool floor")
