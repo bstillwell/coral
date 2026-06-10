@@ -606,64 +606,143 @@ def apply_upmap_queue(cluster, cluster_state, is_dryrun, logger):
                 ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
 
 def display_usage(cluster_state):
-    # Calculate data per OSD after backfilling is complete
-    print("OSD  | Class | Weight   | Size        | Current Usage              | Future Usage               | Change")
-    print("-----+-------+----------+-------------+----------------------------+----------------------------+----------------------------")
+    osds = cluster_state['osds']
+    if not osds:
+        return
 
-    for osd in cluster_state['osds']:
-        device_class = cluster_state['osds'][osd]['device_class']
-        crush_weight = cluster_state['osds'][osd]['crush_weight']
-        drive_size = cluster_state['osds'][osd]['size'] / 1024**3
+    # Pre-format every value as a plain string so we can size columns from the
+    # actual rendered widths rather than guessing.
+    rows = []
+    for osd_id in osds:
+        osd = osds[osd_id]
+        size_gb = osd['size'] / 1024**3
+        cur_gb = osd['current_usage'] / 1024**3
+        fut_gb = osd['future_usage'] / 1024**3
+        cur_pgs = osd['current_pgs']
+        fut_pgs = osd['future_pgs']
+        cur_pct = 100 * cur_gb / size_gb if size_gb else 0.0
+        fut_pct = 100 * fut_gb / size_gb if size_gb else 0.0
+        rows.append({
+            'osd_id':      str(osd_id),
+            'class':       osd['device_class'],
+            'weight':      f"{osd['crush_weight']:.5f}",
+            'size':        f"{size_gb:.1f} GiB",
+            'cur_gb':      f"{cur_gb:.1f} GiB",
+            'cur_pct':     f"{cur_pct:.1f}%",
+            'cur_pct_val': cur_pct,
+            'cur_pgs':     f"{cur_pgs} PGs",
+            'fut_gb':      f"{fut_gb:.1f} GiB",
+            'fut_pct':     f"{fut_pct:.1f}%",
+            'fut_pct_val': fut_pct,
+            'fut_pgs':     f"{fut_pgs} PGs",
+            'chg_gb':      f"{fut_gb - cur_gb:+.1f} GiB",
+            'chg_pct':     f"{fut_pct - cur_pct:+.1f}%",
+            'chg_pgs':     f"{fut_pgs - cur_pgs:+d} PGs",
+        })
 
-        current_usage_gb = cluster_state['osds'][osd]['current_usage'] / 1024**3
-        current_pgs = cluster_state['osds'][osd]['current_pgs']
+    def col_width(key, header):
+        return max(len(header), max(len(r[key]) for r in rows))
 
-        future_usage_gb = cluster_state['osds'][osd]['future_usage'] / 1024**3
-        future_pgs = cluster_state['osds'][osd]['future_pgs']
+    w_osd = col_width('osd_id', 'OSD')
+    w_cls = col_width('class',  'Class')
+    w_wt  = col_width('weight', 'Weight')
+    w_sz  = col_width('size',   'Size')
 
-        if drive_size != 0:
-            current_usage_pct = 100*(current_usage_gb / drive_size)
-            future_usage_pct = 100*(future_usage_gb / drive_size)
+    # Sub-widths inside each grouped column
+    w_cur_gb  = max(len(r['cur_gb'])  for r in rows)
+    w_cur_pct = max(len(r['cur_pct']) for r in rows)
+    w_cur_pgs = max(len(r['cur_pgs']) for r in rows)
+    w_fut_gb  = max(len(r['fut_gb'])  for r in rows)
+    w_fut_pct = max(len(r['fut_pct']) for r in rows)
+    w_fut_pgs = max(len(r['fut_pgs']) for r in rows)
+    w_chg_gb  = max(len(r['chg_gb'])  for r in rows)
+    w_chg_pct = max(len(r['chg_pct']) for r in rows)
+    w_chg_pgs = max(len(r['chg_pgs']) for r in rows)
+
+    SUB_SEP = '  '  # two spaces between sub-fields within a group
+    w_cur = max(w_cur_gb + len(SUB_SEP) + w_cur_pct + len(SUB_SEP) + w_cur_pgs, len('Current Usage'))
+    w_fut = max(w_fut_gb + len(SUB_SEP) + w_fut_pct + len(SUB_SEP) + w_fut_pgs, len('Future Usage'))
+    w_chg = max(w_chg_gb + len(SUB_SEP) + w_chg_pct + len(SUB_SEP) + w_chg_pgs, len('Change'))
+
+    col_widths = [w_osd, w_cls, w_wt, w_sz, w_cur, w_fut, w_chg]
+
+    def border(left, mid, right):
+        return left + mid.join('─' * (cw + 2) for cw in col_widths) + right
+
+    def cell(text, width, align='right'):
+        if align == 'left':
+            content = text.ljust(width)
+        elif align == 'center':
+            content = text.center(width)
         else:
-            current_usage_pct = 0
-            future_usage_pct = 0
+            content = text.rjust(width)
+        return ' ' + content + ' '
 
-        change_usage_gb = future_usage_gb - current_usage_gb
-        change_usage_pct = future_usage_pct - current_usage_pct
-        change_pgs = future_pgs - current_pgs
+    def pct_color(pct):
+        if pct > 100: return L_RED
+        if pct > 90:  return RED
+        if pct > 80:  return YELLOW
+        if pct > 0:   return GREEN
+        return BLUE
 
-        osd_stat_strings = []
-        osd_stat_strings.append(f"{osd:<4}")
-        osd_stat_strings.append(f"{device_class:<5}")
-        osd_stat_strings.append(f"{crush_weight:>8.5f}")
-        osd_stat_strings.append(f"{drive_size:>7.1f} GiB")
+    def grouped_section(parts, group_width):
+        # parts: list of (text, width, color-or-None). Returns a string whose
+        # visible width is exactly group_width, with ANSI codes injected around
+        # any colored part. Right-aligned within the group cell.
+        rendered = []
+        visible = 0
+        for i, (text, width, color) in enumerate(parts):
+            if i:
+                rendered.append(SUB_SEP)
+                visible += len(SUB_SEP)
+            padded = text.rjust(width)
+            rendered.append(f"{color}{padded}{RESET}" if color else padded)
+            visible += width
+        pad = max(0, group_width - visible)
+        return ' ' * pad + ''.join(rendered)
 
-        if current_usage_pct > 100:
-            PCT_COLOR = L_RED
-        elif current_usage_pct > 90:
-            PCT_COLOR = RED
-        elif current_usage_pct > 80:
-            PCT_COLOR = YELLOW
-        elif current_usage_pct > 0:
-            PCT_COLOR = GREEN
-        else:
-            PCT_COLOR = BLUE
-        osd_stat_strings.append(f"{current_usage_gb:>5.1f} GiB  {PCT_COLOR}{current_usage_pct:5.1f}%{RESET}  {current_pgs:>3} PGs")
+    print(border('┌', '┬', '┐'))
+    header = '│' + '│'.join([
+        cell('OSD',           w_osd),
+        cell('Class',         w_cls, 'left'),
+        cell('Weight',        w_wt),
+        cell('Size',          w_sz),
+        cell('Current Usage', w_cur, 'center'),
+        cell('Future Usage',  w_fut, 'center'),
+        cell('Change',        w_chg, 'center'),
+    ]) + '│'
+    print(header)
+    print(border('├', '┼', '┤'))
 
-        if future_usage_pct > 100:
-            PCT_COLOR = L_RED
-        elif future_usage_pct > 90:
-            PCT_COLOR = RED
-        elif future_usage_pct > 80:
-            PCT_COLOR = YELLOW
-        elif future_usage_pct > 0:
-            PCT_COLOR = GREEN
-        else:
-            PCT_COLOR = BLUE
-        osd_stat_strings.append(f"{future_usage_gb:>5.1f} GiB  {PCT_COLOR}{future_usage_pct:5.1f}%{RESET}  {future_pgs:>3} PGs")
-        osd_stat_strings.append(f"{change_usage_gb:+5.1f} GiB  {change_usage_pct:+6.1f}%  {change_pgs:+3} PGs")
+    for r in rows:
+        cur_section = grouped_section([
+            (r['cur_gb'],  w_cur_gb,  None),
+            (r['cur_pct'], w_cur_pct, pct_color(r['cur_pct_val'])),
+            (r['cur_pgs'], w_cur_pgs, None),
+        ], w_cur)
+        fut_section = grouped_section([
+            (r['fut_gb'],  w_fut_gb,  None),
+            (r['fut_pct'], w_fut_pct, pct_color(r['fut_pct_val'])),
+            (r['fut_pgs'], w_fut_pgs, None),
+        ], w_fut)
+        chg_section = grouped_section([
+            (r['chg_gb'],  w_chg_gb,  None),
+            (r['chg_pct'], w_chg_pct, None),
+            (r['chg_pgs'], w_chg_pgs, None),
+        ], w_chg)
 
-        print(" | ".join(osd_stat_strings))
+        line = '│' + '│'.join([
+            cell(r['osd_id'], w_osd),
+            cell(r['class'],  w_cls, 'left'),
+            cell(r['weight'], w_wt),
+            cell(r['size'],   w_sz),
+            ' ' + cur_section + ' ',
+            ' ' + fut_section + ' ',
+            ' ' + chg_section + ' ',
+        ]) + '│'
+        print(line)
+
+    print(border('└', '┴', '┘'))
 
 def display_pgs_by_pool(cluster_state):
     # For each OSD, print a small table showing the future PG count, target

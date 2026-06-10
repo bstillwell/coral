@@ -675,6 +675,57 @@ class TestApplyUpmapQueue:
         cluster.mon_command.assert_not_called()
 
 
+class TestDisplayUsage:
+    @staticmethod
+    def _strip_ansi(s):
+        import re
+        return re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+    def _state(self, osds):
+        # Helper that fills in just enough fields for display_usage
+        return {"osds": {
+            i: {
+                "device_class": cfg.get("device_class", "hdd"),
+                "crush_weight": cfg.get("crush_weight", 1.0),
+                "size": cfg.get("size", 10 * GiB),
+                "current_usage": cfg.get("current_usage", 0),
+                "current_pgs": cfg.get("current_pgs", 0),
+                "future_usage": cfg.get("future_usage", 0),
+                "future_pgs": cfg.get("future_pgs", 0),
+            }
+            for i, cfg in osds.items()
+        }}
+
+    def test_empty_state_prints_nothing(self, capsys):
+        coral.display_usage({"osds": {}})
+        assert capsys.readouterr().out == ""
+
+    def test_borders_align_across_rows(self, capsys):
+        state = self._state({
+            0:   {"current_pgs": 1, "future_pgs": 2},
+            10:  {"current_pgs": 50, "future_pgs": 60},
+            127: {"current_pgs": 1234, "future_pgs": 1240},
+        })
+        coral.display_usage(state)
+        lines = [self._strip_ansi(l) for l in capsys.readouterr().out.splitlines()]
+        # Every line should be the same visible length (table is rectangular)
+        widths = {len(l) for l in lines}
+        assert len(widths) == 1, f"line widths differ: {widths}\n" + "\n".join(lines)
+
+    def test_zero_size_osd_does_not_divide_by_zero(self, capsys):
+        state = self._state({0: {"size": 0, "current_usage": 0, "future_usage": 0}})
+        coral.display_usage(state)  # must not raise
+        assert "0.0%" in self._strip_ansi(capsys.readouterr().out)
+
+    def test_includes_expected_column_headers(self, capsys):
+        state = self._state({0: {}})
+        coral.display_usage(state)
+        out = self._strip_ansi(capsys.readouterr().out)
+        for header in ("OSD", "Class", "Weight", "Size",
+                       "Current Usage", "Future Usage", "Change"):
+            assert header in out
+
+
 class TestDisplayPgsByPool:
     def test_prints_section_per_osd(self, base_cluster_state, capsys):
         coral.display_pgs_by_pool(base_cluster_state)
