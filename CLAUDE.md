@@ -9,14 +9,16 @@ Coral (Clyso Optimized RebALancer) is a Ceph cluster rebalancing tool. It analyz
 ## Running
 
 ```bash
-# Normal mode — connects to Ceph, optimizes, applies changes, logs to /var/log/ceph/coral.log
+# Default (dry-run) — connects to Ceph, computes upmap changes, prints the
+# pg-upmap-items commands instead of applying them. Safe to run.
 ./coral.py
 
-# Preview — show current/future OSD usage without modifying anything
+# Preview — show current/future OSD usage without modifying anything and
+# without writing to the log file
 ./coral.py --preview
 
-# Dry-run — print the Ceph commands that would be executed
-./coral.py --dry-run
+# Apply — actually push the upmap changes to the cluster
+./coral.py --apply
 ```
 
 Requires the `rados` Python package (Ceph RADOS bindings) and a reachable Ceph cluster at `/etc/ceph/ceph.conf`.
