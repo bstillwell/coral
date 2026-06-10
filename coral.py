@@ -20,7 +20,7 @@ CRUSH_ITEM_NONE = 0x7fffffff
 def main():
     parser = argparse.ArgumentParser(description="Coral (Clyso Optimized RebALancer)")
     parser.add_argument('--preview', action='store_true',
-                        help="Show the future cluster state")
+                        help="Show the current and future cluster state based on existing PG up/acting sets only — no rebalancing computation, no cluster or log writes")
     parser.add_argument('--apply', action='store_true',
                         help="Apply the upmap changes to the cluster. Without this flag, coral runs in dry-run mode and prints the pg-upmap-items commands instead.")
     parser.add_argument('--preview-pgs', action='store_true',
@@ -44,18 +44,22 @@ def main():
     # Calculate future OSD usage based on the 'up' set
     calculate_usage(cluster_state, logger)
 
-    # TODO: re-enable once remove_off_target_mappings is rewritten to reduce
-    # the total upmap mapping count
-    # remove_off_target_mappings(cluster_state, logger)
+    # In preview mode, skip the rebalancing computation entirely so the
+    # displayed current/future state reflects only what the cluster will do on
+    # its own from existing PG up/acting sets.
+    if not is_preview:
+        # TODO: re-enable once remove_off_target_mappings is rewritten to reduce
+        # the total upmap mapping count
+        # remove_off_target_mappings(cluster_state, logger)
 
-    # Remove upmap mappings that pull OSDs below their per-pool target floor
-    remove_under_target_mappings(cluster_state, logger)
+        # Remove upmap mappings that pull OSDs below their per-pool target floor
+        remove_under_target_mappings(cluster_state, logger)
 
-    # Add new upmap mappings to pull off-target OSDs into their per-pool range
-    balance_off_target_osds(cluster_state, logger)
+        # Add new upmap mappings to pull off-target OSDs into their per-pool range
+        balance_off_target_osds(cluster_state, logger)
 
-    # Apply the changes we determined were needed
-    apply_upmap_queue(cluster, cluster_state, is_dryrun, logger)
+        # Apply the changes we determined were needed
+        apply_upmap_queue(cluster, cluster_state, is_dryrun, logger)
 
     # Provide a nice display of current and future OSD usage
     display_usage(cluster_state)
