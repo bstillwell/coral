@@ -526,21 +526,9 @@ def balance_off_target_osds(cluster_state, logger):
         bucket_map = cluster_state['osd_bucket_maps'].get(failure_domain, {})
 
         while True:
-            # Recipients: OSDs strictly below their per-pool floor
-            under = []
-            for osd_id in valid_osds:
-                floor = osds[osd_id]['target_pgs_by_pool'].get(pool_id, (0, 0))[0]
-                count = osds[osd_id]['future_pgs_by_pool'].get(pool_id, 0)
-                if count < floor:
-                    under.append((floor - count, osd_id))
-            if not under:
-                break
-            under.sort(reverse=True)
-            destinations = [osd_id for _, osd_id in under]
-
             # Donors: OSDs whose count is strictly above their floor, so
-            # donating one PG keeps them within range. Over-ceil OSDs (largest
-            # excess above floor) naturally sort first.
+            # donating one PG keeps them within range. Over-ceil OSDs naturally
+            # sort first because their excess above floor is largest.
             donors = []
             for osd_id in valid_osds:
                 floor = osds[osd_id]['target_pgs_by_pool'].get(pool_id, (0, 0))[0]
@@ -551,8 +539,26 @@ def balance_off_target_osds(cluster_state, logger):
                 break
             donors.sort(reverse=True)
 
+            # Recipients: OSDs whose count is strictly below their ceil, so
+            # receiving one PG keeps them within range. Under-floor OSDs (the
+            # largest room below ceil) naturally sort first.
+            recipients = []
+            for osd_id in valid_osds:
+                ceil = osds[osd_id]['target_pgs_by_pool'].get(pool_id, (0, 0))[1]
+                count = osds[osd_id]['future_pgs_by_pool'].get(pool_id, 0)
+                if count < ceil:
+                    recipients.append((ceil - count, osd_id))
+            if not recipients:
+                break
+            recipients.sort(reverse=True)
+            destinations = [osd_id for _, osd_id in recipients]
+
             made_move = False
             for _, from_osd in donors:
+                from_count = osds[from_osd]['future_pgs_by_pool'].get(pool_id, 0)
+                from_ceil = osds[from_osd]['target_pgs_by_pool'].get(pool_id, (0, 0))[1]
+                donor_is_over = from_count > from_ceil
+
                 for pgid, pg in cluster_state['pgs'].items():
                     if not pgid.startswith(f"{pool_id}."):
                         continue
@@ -560,6 +566,14 @@ def balance_off_target_osds(cluster_state, logger):
                         continue
                     for to_osd in destinations:
                         if to_osd in pg['up']:
+                            continue
+                        # Only commit a move that actually fixes an imbalance.
+                        # If the donor isn't over-ceil AND the recipient isn't
+                        # under-floor, both endpoints are already in range and
+                        # moving a PG between them just churns upmaps.
+                        to_count = osds[to_osd]['future_pgs_by_pool'].get(pool_id, 0)
+                        to_floor = osds[to_osd]['target_pgs_by_pool'].get(pool_id, (0, 0))[0]
+                        if not donor_is_over and to_count >= to_floor:
                             continue
                         to_bucket = bucket_map.get(to_osd)
                         peer_buckets = {

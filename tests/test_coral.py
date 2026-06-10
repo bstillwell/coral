@@ -586,6 +586,42 @@ class TestBalanceOffTargetOsds:
         assert balance_cluster_state["osds"][0]["future_pgs_by_pool"][1] == 0
         assert balance_cluster_state["osds"][2]["future_pgs_by_pool"][1] == 1
 
+    def test_over_ceil_osd_donates_to_at_floor_recipient(self, balance_cluster_state, logger):
+        # OSD 0 is OVER ceil (count=2, target (0,1)). OSD 1 is at-floor (count=1,
+        # target (1,2)) so it's NOT under-floor, but receiving a PG keeps it at
+        # ceil. With the old recipient criterion (count < floor), no recipient
+        # would be found and the over-ceil OSD would stay over. The function
+        # must allow at-floor (room below ceil) recipients when the donor is
+        # itself over-ceil.
+        balance_cluster_state["osds"][0]["target_pgs_by_pool"][1] = (0, 1)
+        balance_cluster_state["osds"][0]["future_pgs_by_pool"][1] = 2  # over ceil
+        balance_cluster_state["osds"][1]["target_pgs_by_pool"][1] = (1, 2)
+        balance_cluster_state["osds"][1]["future_pgs_by_pool"][1] = 1  # at floor, room below ceil
+        balance_cluster_state["osds"][2]["target_pgs_by_pool"][1] = (0, 0)  # zero target — not a recipient
+        # OSD 1 is already in pg.up so move from 0 must land on a different OSD.
+        # Adjust the PG so OSD 2 is the only valid destination.
+        balance_cluster_state["pgs"]["1.0"]["up"] = [0]
+        balance_cluster_state["osds"][2]["target_pgs_by_pool"][1] = (1, 2)  # now a valid recipient (room=2)
+        balance_cluster_state["osds"][2]["future_pgs_by_pool"][1] = 1       # at floor
+
+        coral.balance_off_target_osds(balance_cluster_state, logger)
+        # Move from over-ceil OSD 0 to at-floor OSD 2 (donor IS over, so the
+        # at-floor recipient is allowed).
+        assert "1.0" in balance_cluster_state["upmap_queue"]
+        assert balance_cluster_state["osds"][0]["future_pgs_by_pool"][1] == 1
+        assert balance_cluster_state["osds"][2]["future_pgs_by_pool"][1] == 2
+
+    def test_does_not_shuffle_when_everyone_in_range(self, balance_cluster_state, logger):
+        # Both endpoints in range (floor <= count <= ceil) should NOT trigger a
+        # move — that would just churn upmaps. OSD 0 at-ceil (count=1, (0,1))
+        # and OSD 2 at-floor (count=0, (0,1)) are both in range; no over-ceil
+        # and no under-floor OSD exists, so we should make zero moves.
+        balance_cluster_state["osds"][0]["target_pgs_by_pool"][1] = (0, 1)
+        balance_cluster_state["osds"][1]["target_pgs_by_pool"][1] = (0, 1)
+        balance_cluster_state["osds"][2]["target_pgs_by_pool"][1] = (0, 1)
+        coral.balance_off_target_osds(balance_cluster_state, logger)
+        assert balance_cluster_state["upmap_queue"] == {}
+
     def test_falls_back_to_next_over_target_osd_when_top_cannot_move(self, logger):
         # OSD 0 is the most over-target (excess 2) but its only PG (1.0) can't
         # move to OSD 2 — OSD 2 shares OSD 1's bucket, blocking the placement.
