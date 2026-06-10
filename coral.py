@@ -748,22 +748,11 @@ def display_pgs_by_pool(cluster_state):
     # For each OSD, print a small table showing the future PG count, target
     # floor/ceil, and status (OVER/UNDER/OK) per pool. Pools where the OSD
     # has neither a target entry nor any future PGs are skipped.
-
-    # Size the Pool column to the longest pool name so output stays aligned
-    # across OSD sections, even with mixed-length names like ".mgr" and
-    # "default.rgw.buckets.index".
     def _pool_name(pool_id):
         return cluster_state['pools'].get(pool_id, {}).get('name', f"pool_{pool_id}")
 
-    pool_ids_used = set()
-    for osd in cluster_state['osds'].values():
-        pool_ids_used.update(osd.get('target_pgs_by_pool', {}))
-        pool_ids_used.update(osd.get('future_pgs_by_pool', {}))
-    pool_col_width = max([len("Pool")] + [len(_pool_name(p)) for p in pool_ids_used])
-
-    header = f"{'Pool':<{pool_col_width}} | Future PGs | Floor | Ceil | Status"
-    separator = f"{'-' * pool_col_width}-+------------+-------+------+--------"
-
+    # Build per-OSD row sets first so we can size every table uniformly.
+    sections = []
     for osd_id in cluster_state['osds']:
         osd = cluster_state['osds'][osd_id]
         target_by_pool = osd.get('target_pgs_by_pool', {})
@@ -771,25 +760,91 @@ def display_pgs_by_pool(cluster_state):
         pool_ids = sorted(set(target_by_pool) | set(future_by_pool))
         if not pool_ids:
             continue
-
-        print()
-        print(f"== OSD {osd_id} ==")
-        print(header)
-        print(separator)
-
+        rows = []
         for pool_id in pool_ids:
-            pool_name = _pool_name(pool_id)
             future_pgs = future_by_pool.get(pool_id, 0)
             floor, ceil = target_by_pool.get(pool_id, (0, 0))
-
             if future_pgs > ceil:
-                status = f"{RED}OVER{RESET}"
+                status, status_color = 'OVER', RED
             elif future_pgs < floor:
-                status = f"{YELLOW}UNDER{RESET}"
+                status, status_color = 'UNDER', YELLOW
             else:
-                status = f"{GREEN}OK{RESET}"
+                status, status_color = 'OK', GREEN
+            rows.append({
+                'pool':       _pool_name(pool_id),
+                'future_pgs': str(future_pgs),
+                'floor':      str(floor),
+                'ceil':       str(ceil),
+                'status':     status,
+                'color':      status_color,
+            })
+        sections.append((osd_id, rows))
 
-            print(f"{pool_name:<{pool_col_width}} | {future_pgs:>10} | {floor:>5} | {ceil:>4} | {status}")
+    if not sections:
+        return
+
+    # Pool column sizes to the longest pool name across every OSD; the numeric
+    # columns size to whichever value is widest. Keeps tables aligned across
+    # OSDs even when one has long names like default.rgw.buckets.index.
+    all_rows = [r for _, rows in sections for r in rows]
+    w_pool   = max([len('Pool')]       + [len(r['pool'])       for r in all_rows])
+    w_future = max([len('Future PGs')] + [len(r['future_pgs']) for r in all_rows])
+    w_floor  = max([len('Floor')]      + [len(r['floor'])      for r in all_rows])
+    w_ceil   = max([len('Ceil')]       + [len(r['ceil'])       for r in all_rows])
+    w_status = max([len('Status')]     + [len(r['status'])     for r in all_rows])
+
+    col_widths = [w_pool, w_future, w_floor, w_ceil, w_status]
+
+    def border(left, mid, right):
+        return left + mid.join('─' * (cw + 2) for cw in col_widths) + right
+
+    def cell(text, width, align='right'):
+        if align == 'left':
+            content = text.ljust(width)
+        elif align == 'center':
+            content = text.center(width)
+        else:
+            content = text.rjust(width)
+        return ' ' + content + ' '
+
+    def colored_cell(text, width, color, align='center'):
+        # Pad first so visible width matches the column, then wrap with ANSI.
+        if align == 'left':
+            padded = text.ljust(width)
+        elif align == 'right':
+            padded = text.rjust(width)
+        else:
+            padded = text.center(width)
+        return ' ' + color + padded + RESET + ' '
+
+    top    = border('┌', '┬', '┐')
+    middle = border('├', '┼', '┤')
+    bottom = border('└', '┴', '┘')
+    header = '│' + '│'.join([
+        cell('Pool',       w_pool, 'left'),
+        cell('Future PGs', w_future),
+        cell('Floor',      w_floor),
+        cell('Ceil',       w_ceil),
+        cell('Status',     w_status, 'center'),
+    ]) + '│'
+
+    for i, (osd_id, rows) in enumerate(sections):
+        if i:
+            print()
+        print(f"{CYAN}osd.{osd_id}{RESET}")
+        print(top)
+        print(header)
+        print(middle)
+        for r in rows:
+            line = '│' + '│'.join([
+                cell(r['pool'],       w_pool, 'left'),
+                cell(r['future_pgs'], w_future),
+                cell(r['floor'],      w_floor),
+                cell(r['ceil'],       w_ceil),
+                colored_cell(r['status'], w_status, r['color'], 'center'),
+            ]) + '│'
+            print(line)
+        print(bottom)
 
 if __name__ == '__main__':
     main()
