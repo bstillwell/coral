@@ -727,41 +727,44 @@ class TestDisplayUsage:
 
 
 class TestDisplayPgsByPool:
-    def test_prints_section_per_osd(self, base_cluster_state, capsys):
+    @staticmethod
+    def _strip_ansi(s):
+        import re
+        return re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+    def test_prints_label_per_osd(self, base_cluster_state, capsys):
         coral.display_pgs_by_pool(base_cluster_state)
-        out = capsys.readouterr().out
-        assert "== OSD 0 ==" in out
-        assert "== OSD 1 ==" in out
+        out = self._strip_ansi(capsys.readouterr().out)
+        assert "osd.0" in out
+        assert "osd.1" in out
 
     def test_marks_over_target_as_over(self, base_cluster_state, capsys):
         # OSD 1 default: future=1, ceil=1. Bump count above ceil → OVER.
         base_cluster_state["osds"][1]["future_pgs_by_pool"][1] = 5
         coral.display_pgs_by_pool(base_cluster_state)
-        out = capsys.readouterr().out
+        out = self._strip_ansi(capsys.readouterr().out)
         assert "OVER" in out
 
     def test_marks_under_target_as_under(self, base_cluster_state, capsys):
         # Raise OSD 0's floor so its count (0) lands under it
         base_cluster_state["osds"][0]["target_pgs_by_pool"][1] = (2, 3)
         coral.display_pgs_by_pool(base_cluster_state)
-        out = capsys.readouterr().out
+        out = self._strip_ansi(capsys.readouterr().out)
         assert "UNDER" in out
 
     def test_marks_on_target_as_ok(self, base_cluster_state, capsys):
         coral.display_pgs_by_pool(base_cluster_state)
-        out = capsys.readouterr().out
+        out = self._strip_ansi(capsys.readouterr().out)
         assert "OK" in out
         assert "OVER" not in out
         assert "UNDER" not in out
 
     def test_shows_floor_ceil_and_future_count(self, base_cluster_state, capsys):
         coral.display_pgs_by_pool(base_cluster_state)
-        out = capsys.readouterr().out
-        # Header columns
+        out = self._strip_ansi(capsys.readouterr().out)
         assert "Future PGs" in out
         assert "Floor" in out
         assert "Ceil" in out
-        # Pool name from fixture
         assert "rbd" in out
 
     def test_skips_osd_with_no_pool_entries(self, capsys):
@@ -772,13 +775,11 @@ class TestDisplayPgsByPool:
             "pools": {},
         }
         coral.display_pgs_by_pool(state)
-        out = capsys.readouterr().out
-        assert "== OSD 0 ==" not in out
+        out = self._strip_ansi(capsys.readouterr().out)
+        assert "osd.0" not in out
 
-    def test_pool_column_width_grows_to_longest_name(self, capsys):
-        # A mix of short and long pool names. The Pool column should size to
-        # the longest name so every row's separator " | " lands at the same
-        # column. Verify by comparing the prefix length of two data rows.
+    def test_table_lines_have_uniform_width(self, capsys):
+        # Mix of short and long pool names exercises dynamic width sizing.
         long_name = "default.rgw.buckets.index"
         state = {
             "osds": {
@@ -786,17 +787,18 @@ class TestDisplayPgsByPool:
                     "future_pgs_by_pool": {1: 0, 2: 0},
                     "target_pgs_by_pool": {1: (0, 1), 2: (0, 1)},
                 },
+                127: {
+                    "future_pgs_by_pool": {1: 0, 2: 0},
+                    "target_pgs_by_pool": {1: (0, 1), 2: (0, 1)},
+                },
             },
-            "pools": {
-                1: {"name": "rbd"},
-                2: {"name": long_name},
-            },
+            "pools": {1: {"name": "rbd"}, 2: {"name": long_name}},
         }
         coral.display_pgs_by_pool(state)
-        out = capsys.readouterr().out
-        # Every row's " | " separator after the pool name should align at the
-        # same column index.
-        sep_idx = [line.index(" | ") for line in out.splitlines() if " | " in line]
-        assert len(set(sep_idx)) == 1
-        # Width should be the long name's length (longer than "Pool")
-        assert sep_idx[0] == len(long_name)
+        out = self._strip_ansi(capsys.readouterr().out)
+        # Every line that's part of a table (contains any box-drawing char)
+        # should be the same visible length.
+        box_chars = set("┌┐└┘├┤┬┴┼│─")
+        table_lines = [l for l in out.splitlines() if any(c in l for c in box_chars)]
+        widths = {len(l) for l in table_lines}
+        assert len(widths) == 1, f"table line widths differ: {widths}\n" + "\n".join(table_lines)
