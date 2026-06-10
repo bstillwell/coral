@@ -21,14 +21,14 @@ def main():
     parser = argparse.ArgumentParser(description="Coral (Clyso Optimized RebALancer)")
     parser.add_argument('--preview', action='store_true',
                         help="Show the future cluster state")
-    parser.add_argument('--dry-run', action='store_true',
-                        help="Don't modify the pg upmaps, print out the pg-upmap-items commands instead")
+    parser.add_argument('--apply', action='store_true',
+                        help="Apply the upmap changes to the cluster. Without this flag, coral runs in dry-run mode and prints the pg-upmap-items commands instead.")
     parser.add_argument('--preview-pgs', action='store_true',
                         help="After the usage table, print a per-OSD breakdown of future PGs by pool with their target floor/ceil")
     args = parser.parse_args()
 
     is_preview = args.preview
-    is_dryrun = args.dry_run or is_preview
+    is_dryrun = is_preview or not args.apply
 
     logger = setup_logging("/var/log/ceph/coral.log", is_preview=args.preview)
     logger.info("Initializing Coral Balancer")

@@ -11,16 +11,15 @@ Coral (Clyso Optimized RebALancer) is a Ceph cluster rebalancing tool. It analyz
 ## Usage
 
 ```
-./coral.py [--preview] [--dry-run]
+./coral.py [--preview] [--apply] [--preview-pgs]
 ```
 
 | Flag | Behavior |
 |------|----------|
-| _(none)_ | Connect to the cluster, add balancing upmaps, log to `/var/log/ceph/coral.log` |
-| `--preview` | Show current and future OSD usage table without modifying anything |
-| `--dry-run` | Print the `ceph osd pg-upmap-items` / `ceph osd rm-pg-upmap-items` commands that would be run |
-
-`--dry-run` implies `--preview` — no cluster writes occur in either mode.
+| _(none)_ | Default: dry-run. Connect to the cluster, compute the changes, and print the `ceph osd pg-upmap-items` / `ceph osd rm-pg-upmap-items` commands that would be run. Logs to `/var/log/ceph/coral.log`. |
+| `--apply` | Actually push the upmap changes to the cluster. |
+| `--preview` | Show current and future OSD usage without modifying anything and without writing to the log file. Implies dry-run. |
+| `--preview-pgs` | After the usage table, also print a per-OSD breakdown of future PGs by pool with their target floor/ceil. |
 
 ## How it works
 
