@@ -47,9 +47,7 @@ get_backfillfull_ratio() → backfillfull_ratio float
 
 `get_cluster_state()` finishes by calling `calculate_pg_distribution()`, which fills in `osds[osd_id]['target_pgs_by_pool'][pool_id] = (floor, ceil)` — the per-OSD min/max PG count for a balanced cluster, derived from the OSD's CRUSH-weight share among the pool rule's `valid_osds`, scaled by `pg_num * pool_size` (replica count or k+m). OSDs whose `crush_weight < 0.0001` are treated as zero so they don't pull a share away from the rest.
 
-`calculate_usage()` populates `current_usage`/`future_usage` and per-pool PG counts (`current_pgs_by_pool` / `future_pgs_by_pool`) per OSD. `balance_off_target_osds()` then walks each pool and queues new upmaps — via `queue_upmap_mapping_addition()` — that move PGs from the most over-ceil OSD to the most under-floor OSD, while respecting the pool's CRUSH rule (`valid_osds`) and failure-domain uniqueness (looked up via `osd_bucket_maps[failure_domain]`). Finally `apply_upmap_queue()` sends `osd pg-upmap-items` / `osd rm-pg-upmap-items` commands to the cluster.
-
-`remove_off_target_mappings()` (the inverse — removing existing upmaps that push OSDs off-target) exists but is currently disabled in `main()` pending a rewrite focused on reducing the total upmap mapping count.
+`calculate_usage()` populates `current_usage`/`future_usage` and per-pool PG counts (`current_pgs_by_pool` / `future_pgs_by_pool`) per OSD. `remove_under_target_mappings()` then drops any existing upmap whose source OSD's per-pool count is below the floor — restoring the redirected PG to that OSD. After that, `balance_off_target_osds()` walks each pool and queues new upmaps — via `queue_upmap_mapping_addition()` — that move PGs from donor OSDs (count > floor) to recipients (count < floor), while respecting the pool's CRUSH rule (`valid_osds`) and failure-domain uniqueness (looked up via `osd_bucket_maps[failure_domain]`). Finally `apply_upmap_queue()` sends `osd pg-upmap-items` / `osd rm-pg-upmap-items` commands to the cluster.
 
 ## RADOS Communication
 
