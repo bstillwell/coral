@@ -586,8 +586,6 @@ def balance_off_target_osds(cluster_state, logger):
                 count = osds[osd_id]['future_pgs_by_pool'].get(pool_id, 0)
                 if count < ceil:
                     recipients.append((ceil - count, osd_id))
-            if not recipients:
-                break
             recipients.sort(reverse=True)
             destinations = [osd_id for _, osd_id in recipients]
 
@@ -633,7 +631,60 @@ def balance_off_target_osds(cluster_state, logger):
                     break
 
             if not made_move:
+                made_move = drain_to_at_ceil_osd(cluster_state, pool_id, valid_osds, bucket_map, logger)
+
+            if not made_move:
                 break
+
+def drain_to_at_ceil_osd(cluster_state, pool_id, valid_osds, bucket_map, logger):
+    """Move one PG off an OSD whose target is 0 when no in-range move exists.
+
+    A ceil of 0 means the OSD is being drained (out, or CRUSH weight ~0). Its
+    last PGs can get stuck when every OSD with room below its ceil is already
+    in the PG or shares a failure domain with it. In that case, let the PG go
+    to an OSD that's already at (or over) its ceil, least excess first. That
+    OSD is then over-ceil, so the next pass of balance_off_target_osds()
+    treats it as a donor and passes some other PG on to an OSD with room.
+
+    This can't loop: it only ever moves PGs off ceil-0 OSDs, and normal moves
+    never move PGs onto them (their count is never below a ceil of 0).
+    """
+    osds = cluster_state['osds']
+
+    def target(osd_id):
+        return osds[osd_id]['target_pgs_by_pool'].get(pool_id, (0, 0))
+
+    def count(osd_id):
+        return osds[osd_id]['future_pgs_by_pool'].get(pool_id, 0)
+
+    draining = sorted((o for o in valid_osds if target(o)[1] == 0 and count(o) > 0),
+                      key=lambda o: (-count(o), o))
+    destinations = sorted((o for o in valid_osds if target(o)[1] > 0),
+                          key=lambda o: (count(o) - target(o)[1], o))
+
+    for from_osd in draining:
+        for pgid, pg in cluster_state['pgs'].items():
+            if not pgid.startswith(f"{pool_id}."):
+                continue
+            if from_osd not in pg['up']:
+                continue
+            peer_buckets = {
+                bucket_map.get(o) for o in pg['up']
+                if o != from_osd and o != CRUSH_ITEM_NONE
+            }
+            for to_osd in destinations:
+                if to_osd in pg['up']:
+                    continue
+                if bucket_map.get(to_osd) in peer_buckets:
+                    continue
+                logger.info(
+                    f"Adding draining upmap {pgid}: ({from_osd} -> {to_osd}) "
+                    f"[pool={pool_id}, to_count={count(to_osd)}/ceil={target(to_osd)[1]}]"
+                )
+                queue_upmap_mapping_addition(cluster_state, pgid, (from_osd, to_osd), logger)
+                return True
+
+    return False
 
 def apply_upmap_queue(cluster, cluster_state, is_dryrun, logger):
     logger.debug("Applying upmap changes")

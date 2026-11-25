@@ -670,6 +670,48 @@ class TestBalanceOffTargetOsds:
         coral.balance_off_target_osds(balance_cluster_state, logger)
         assert balance_cluster_state["upmap_queue"] == {}
 
+    def test_drained_osd_hands_off_through_at_ceil_osd(self, balance_cluster_state, logger):
+        # OSD 0 is being drained (target (0, 0)) and holds a replica of PG 1.0.
+        # The only OSD with room below its ceil (3) shares host1 with OSD 1,
+        # which holds the PG's other replica, so a direct move is blocked.
+        # OSD 2 is at its ceil but on a free host: the PG has to go there, and
+        # then OSD 2 (now over-ceil) passes PG 1.1 on to OSD 3. Without the
+        # drain fallback the balancer stops and OSD 0 keeps its PG.
+        state = balance_cluster_state
+
+        def osd(count, target):
+            return {"size": 10 * GiB, "current_usage": count * GiB, "current_pgs": count,
+                    "current_pgs_by_pool": {1: count}, "future_usage": count * GiB,
+                    "future_pgs": count, "future_pgs_by_pool": {1: count},
+                    "target_pgs_by_pool": {1: target}}
+
+        state["osds"] = {0: osd(1, (0, 0)), 1: osd(1, (1, 1)), 2: osd(1, (1, 1)),
+                         3: osd(0, (1, 1)), 4: osd(1, (1, 1))}
+        state["pgs"] = {
+            "1.0": {"up": [0, 1], "acting": [0, 1], "state": ["active", "clean"], "num_bytes": GiB, "upmaps": []},
+            "1.1": {"up": [2, 4], "acting": [2, 4], "state": ["active", "clean"], "num_bytes": GiB, "upmaps": []},
+        }
+        state["pools"][1]["pgs"] = 2
+        state["crush_rules"][0]["valid_osds"] = [0, 1, 2, 3, 4]
+        state["osd_bucket_maps"]["host"] = {0: "host0", 1: "host1", 2: "host2", 3: "host1", 4: "host4"}
+
+        coral.balance_off_target_osds(state, logger)
+
+        assert state["upmap_queue"] == {"1.0": [(0, 2)], "1.1": [(2, 3)]}
+        assert {o: state["osds"][o]["future_pgs_by_pool"][1] for o in state["osds"]} == \
+            {0: 0, 1: 1, 2: 1, 3: 1, 4: 1}
+
+    def test_drain_fallback_leaves_pg_when_every_destination_is_blocked(self, balance_cluster_state, logger):
+        # Same drained OSD 0, but the only other OSDs share host1 with OSD 1 —
+        # there's nowhere legal to put the replica, so nothing is queued.
+        state = balance_cluster_state
+        state["osds"][2]["future_pgs_by_pool"][1] = 1
+        state["osds"][2]["future_pgs"] = 1
+        state["osd_bucket_maps"]["host"][2] = "host1"
+        coral.balance_off_target_osds(state, logger)
+        assert state["upmap_queue"] == {}
+        assert state["osds"][0]["future_pgs_by_pool"][1] == 1
+
     def test_pool_with_osd_failure_domain_can_balance(self, balance_cluster_state, logger):
         # Pool's CRUSH rule has an OSD-level failure domain. Two OSDs sharing
         # a host is fine — every OSD is its own bucket. Without the fix in
@@ -770,9 +812,12 @@ class TestBalanceOffTargetOsds:
             }},
             "upmap_queue": {},
         }
-        # OSD 0 is most-over (synthetic count=2 vs ceil=0); OSDs 1, 3, 4 each have one PG;
+        # OSD 0 is most-over (synthetic count=3 vs target (1, 1)); OSDs 1, 3, 4 each have one PG;
         # OSD 2 is under by 1. The first iteration tries OSD 0, fails, must try OSD 3.
-        state["osds"][0]["future_pgs_by_pool"][1] = 2
+        # OSD 0's target is non-zero so it isn't a drained OSD — otherwise the
+        # drain fallback (drain_to_at_ceil_osd) would legitimately move 1.0 to OSD 4.
+        state["osds"][0]["target_pgs_by_pool"][1] = (1, 1)
+        state["osds"][0]["future_pgs_by_pool"][1] = 3
         state["osds"][1]["target_pgs_by_pool"][1] = (1, 1)
         state["osds"][1]["future_pgs_by_pool"][1] = 1
         state["osds"][3]["future_pgs_by_pool"][1] = 1
