@@ -19,6 +19,9 @@ OSD_DUMP = {
     "pg_upmap_items": [
         {"pgid": "1.0", "mappings": [{"from": 0, "to": 1}]}
     ],
+    "pools": [
+        {"pool": 1, "pool_name": "rbd", "type": 1, "crush_rule": 0, "pg_num": 128, "size": 3}
+    ],
 }
 
 OSD_DF = {
@@ -42,13 +45,10 @@ PG_DUMP = {
     }
 }
 
-POOL_LS_REPLICA = [
-    {"pool_id": 1, "pool_name": "rbd", "type": 1, "crush_rule": 0, "pg_num": 128, "size": 3}
-]
-
-POOL_LS_EC = [
+# EC variant of OSD_DUMP["pools"]
+POOLS_EC = [
     {
-        "pool_id": 1,
+        "pool": 1,
         "pool_name": "ecpool",
         "type": 3,
         "crush_rule": 0,
@@ -88,7 +88,6 @@ def make_mock_cluster(overrides=None):
         "osd dump": OSD_DUMP,
         "osd df": OSD_DF,
         "pg dump": PG_DUMP,
-        "osd pool ls": POOL_LS_REPLICA,
         "osd erasure-code-profile get": EC_PROFILE,
         "osd crush rule dump": CRUSH_RULE_DUMP,
         "osd crush tree": CRUSH_TREE,

@@ -176,14 +176,16 @@ def get_pool_info(cluster, logger):
 
     logger.debug("Gathering info for pools")
 
-    # Grab name, type (replica/erasure) pg count, crush rule, and size (replica count/erase coding shards) for each pool
-    cmd = {'prefix': 'osd pool ls', 'detail': 'detail', 'format': 'json'}
+    # Grab name, type (replica/erasure) pg count, crush rule, and size (replica count/erase coding shards) for each pool.
+    # 'osd dump' carries the same per-pool objects as 'osd pool ls detail' (keyed 'pool' instead of 'pool_id').
+    cmd = {'prefix': 'osd dump', 'format': 'json'}
     ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
-    pool_info_full = json.loads(output.decode('utf-8'))
+    osd_dump = json.loads(output.decode('utf-8'))
 
     pool_info = {}
-    for pool in pool_info_full:
-        pool_info[pool['pool_id']] = {
+    for pool in osd_dump['pools']:
+        pool_id = pool['pool']
+        pool_info[pool_id] = {
             'name': pool['pool_name'],
             'type': POOL_TYPE_NAMES[pool['type']],
             'crush_rule': pool['crush_rule'],
@@ -197,8 +199,8 @@ def get_pool_info(cluster, logger):
             ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
             ec_profile = json.loads(output.decode('utf-8'))
 
-            pool_info[pool['pool_id']]['k'] = int(ec_profile['k'])
-            pool_info[pool['pool_id']]['m'] = int(ec_profile['m'])
+            pool_info[pool_id]['k'] = int(ec_profile['k'])
+            pool_info[pool_id]['m'] = int(ec_profile['m'])
 
     return pool_info
 

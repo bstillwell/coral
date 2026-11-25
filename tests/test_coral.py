@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import coral
-from conftest import make_mock_cluster, GiB, OSD_DUMP, POOL_LS_EC
+from conftest import make_mock_cluster, GiB, OSD_DUMP, POOLS_EC
 
 
 class TestGetRuleFailureDomain:
@@ -86,11 +86,17 @@ class TestGetPoolInfo:
         assert "k" not in result[1]
 
     def test_ec_pool_fetches_k_and_m(self, logger):
-        cluster = make_mock_cluster({"osd pool ls": POOL_LS_EC})
+        cluster = make_mock_cluster({"osd dump": {**OSD_DUMP, "pools": POOLS_EC}})
         result = coral.get_pool_info(cluster, logger)
         assert result[1]["type"] == "erasure"
         assert result[1]["k"] == 4
         assert result[1]["m"] == 2
+
+    def test_reads_pools_from_osd_dump(self, mock_cluster, logger):
+        coral.get_pool_info(mock_cluster, logger)
+        prefixes = [json.loads(c.args[0])["prefix"] for c in mock_cluster.mon_command.call_args_list]
+        assert "osd pool ls" not in prefixes
+        assert "osd dump" in prefixes
 
 
 class TestGetBackfillfullRatio:
