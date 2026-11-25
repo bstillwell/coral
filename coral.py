@@ -312,24 +312,31 @@ def get_osd_bucket_maps(cluster, logger):
 
     logger.debug("Gathering CRUSH tree")
 
-    # Grab the CRUSH tree
-    cmd = {'prefix': 'osd crush tree', 'format': 'json'}
+    # Grab the same --show-shadow tree get_crush_rules() uses, so a capture of
+    # the cluster only needs that one tree.
+    cmd = {'prefix': 'osd crush tree', 'shadow': '--show-shadow', 'format': 'json'}
     ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
     crush_tree = json.loads(output.decode('utf-8'))
 
     logger.debug("Building failure-domain to OSDs maps")
 
+    # Skip the device-class shadow buckets (e.g. 'host0~hdd'). Each OSD sits
+    # under both its real bucket and a shadow copy of it; only the real
+    # buckets name the failure domains. Ceph doesn't allow '~' in bucket
+    # names, so it reliably marks a shadow bucket.
+    real_nodes = [n for n in crush_tree.get('nodes', []) if '~' not in n['name']]
+
     # Create a mapping of all CRUSH IDs to their parent IDs
-    nodes = {n['id']: n for n in crush_tree.get('nodes', [])}
+    nodes = {n['id']: n for n in real_nodes}
     parent_of = {}
-    for node in crush_tree.get('nodes', []):
+    for node in real_nodes:
         for child_id in node.get('children', []):
             parent_of[child_id] = node['id']
 
     bucket_maps = {}
     for failure_domain_type in failure_domain_types:
         m = {}
-        for node in crush_tree.get('nodes', []):
+        for node in nodes.values():
             # We only care about OSDs, so skip the others
             if node.get('type') != 'osd':
                 continue

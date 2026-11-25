@@ -195,6 +195,35 @@ class TestGetOsdBucketMaps:
         result = coral.get_osd_bucket_maps(cluster, logger)
         assert result["osd"] == {0: "osd.0", 1: "osd.1"}
 
+    def test_ignores_device_class_shadow_buckets(self, logger):
+        # Shape of real 'osd crush tree --show-shadow' output: shadow buckets
+        # come after the real ones and each OSD is listed once per tree. The
+        # shadow host would otherwise overwrite the OSD's real parent and the
+        # failure domain would come back as 'host0~hdd' instead of 'host0'.
+        shadow_tree = {
+            "nodes": [
+                {"id": -1, "name": "default", "type": "root", "children": [-2, -3]},
+                {"id": -2, "name": "host0", "type": "host", "children": [0]},
+                {"id": 0, "name": "osd.0", "type": "osd", "children": []},
+                {"id": -3, "name": "host1", "type": "host", "children": [1]},
+                {"id": 1, "name": "osd.1", "type": "osd", "children": []},
+                {"id": -10, "name": "default~hdd", "type": "root", "children": [-11, -12]},
+                {"id": -11, "name": "host0~hdd", "type": "host", "children": [0]},
+                {"id": 0, "name": "osd.0", "type": "osd", "children": []},
+                {"id": -12, "name": "host1~hdd", "type": "host", "children": [1]},
+                {"id": 1, "name": "osd.1", "type": "osd", "children": []},
+            ]
+        }
+        cluster = make_mock_cluster({"osd crush tree": shadow_tree})
+        result = coral.get_osd_bucket_maps(cluster, logger)
+        assert result["host"] == {0: "host0", 1: "host1"}
+
+    def test_requests_shadow_tree(self, mock_cluster, logger):
+        coral.get_osd_bucket_maps(mock_cluster, logger)
+        tree_cmds = [json.loads(c.args[0]) for c in mock_cluster.mon_command.call_args_list
+                     if json.loads(c.args[0])["prefix"] == "osd crush tree"]
+        assert tree_cmds and all(c.get("shadow") == "--show-shadow" for c in tree_cmds)
+
 
 class TestCalculatePgDistribution:
     @staticmethod
