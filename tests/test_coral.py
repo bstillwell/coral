@@ -968,6 +968,39 @@ class TestUpmapItemHelpers:
         assert plan == {"1.0": [2, 1]}
         assert coral.next_upmap_step([0, 1], [0, 1], plan["1.0"], all_in) == [(0, 2)]
 
+    # An EC 4+3 PG with failure domain cage: shard 2 goes from OSD 0 (cage-a1)
+    # to OSD 10 (cage-b1) and shard 4 from OSD 4 (cage-b1) to OSD 5 (cage-a1).
+    # Either alone puts two shards in one cage, and the mon then cancels every
+    # upmap item of the PG.
+    CAGE = {1: "cage-a2", 15: "cage-e2", 0: "cage-a1", 8: "cage-b2", 4: "cage-b1", 21: "cage-c1",
+            2: "cage-d1", 10: "cage-b1", 5: "cage-a1", 9: "cage-c2", 22: "cage-f1"}
+
+    def test_next_step_keeps_failure_domains_distinct(self):
+        raw, current, target = [9, 15, 10, 8, 22, 21, 2], [1, 15, 0, 8, 4, 21, 2], [1, 15, 10, 8, 5, 21, 2]
+        # without failure domains the step drops (10 -> 0) alone: two shards in cage-b1
+        unsafe = coral.apply_upmap_items(raw, coral.next_upmap_step(raw, current, target, all_in), all_in)
+        assert coral.failure_domain_conflicts(unsafe, self.CAGE.get) == 1
+        # with them, both shards change together
+        items = coral.next_upmap_step(raw, current, target, all_in, bucket_of=self.CAGE.get)
+        assert sorted(items) == [(9, 1), (22, 5)]
+        assert coral.apply_upmap_items(raw, items, all_in) == target
+
+    def test_next_step_prefers_a_valid_single_shard_over_the_fullest(self):
+        # Moving the fullest shard (OSD 0 -> 3) first would share bucket B with
+        # OSD 1; moving OSD 1 -> 4 first is valid, so that goes first.
+        buckets = {0: "A", 1: "B", 2: "C", 3: "B", 4: "D"}.get
+        raw = [0, 1, 2]
+        items = coral.next_upmap_step(raw, [0, 1, 2], [3, 4, 2], all_in, utilization={0: 0.9}, bucket_of=buckets)
+        assert coral.apply_upmap_items(raw, items, all_in) == [0, 4, 2]
+
+    def test_round_uses_pool_failure_domains(self, logger):
+        cluster = MagicMock()
+        cluster.mon_command.return_value = (0, b'', '')
+        pgs = {"25.6f": stepping_pg([1, 15, 0, 8, 4, 21, 2], upmaps=[(9, 1), (10, 0), (22, 4)])}
+        coral.apply_upmap_round(cluster, {"25.6f": [1, 15, 10, 8, 5, 21, 2]}, pgs, all_in, False, logger,
+                                failure_domains={25: self.CAGE})
+        assert json.loads(cluster.mon_command.call_args.args[0])["id"] == [9, 1, 22, 5]
+
     def test_next_step_can_restore_crush_placement(self):
         # Dropping an item is a single-shard step too
         raw = [0, 1]
