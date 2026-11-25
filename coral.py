@@ -6,6 +6,7 @@ import logging
 import math
 import rados
 import sys
+from collections import defaultdict
 
 BLUE = '\033[0;34m'
 CYAN = '\033[0;36m'
@@ -48,8 +49,8 @@ def main():
     # displayed current/future state reflects only what the cluster will do on
     # its own from existing PG up/acting sets.
     if not is_preview:
-        # Remove upmap mappings that pull OSDs below their per-pool target floor
-        remove_under_target_mappings(cluster_state, logger)
+        # Simulate removing every upmap, then keep only the existing ones that help
+        rebuild_upmaps(cluster_state, logger)
 
         # Add new upmap mappings to pull off-target OSDs into their per-pool range
         balance_off_target_osds(cluster_state, logger)
@@ -471,7 +472,10 @@ def queue_upmap_mapping_removal(cluster_state, pgid, mapping, logger):
     # Each EC shard only holds num_bytes / k; replica shards hold the full PG
     per_osd_bytes = num_bytes if pool['type'] == 'replica' else num_bytes / pool['k']
 
-    cluster_state['pgs'][pgid]['upmaps'].remove(mapping)
+    upmaps = cluster_state['pgs'][pgid]['upmaps']
+    old_items = list(upmaps)
+    upmaps.remove(mapping)
+    update_upmap_roles(cluster_state, pgid, old_items, upmaps)
 
     # Reflect the restored placement in the up set so later passes (e.g.
     # balance_off_target_osds) see the PG back on from_osd, not on to_osd.
@@ -492,22 +496,164 @@ def queue_upmap_mapping_removal(cluster_state, pgid, mapping, logger):
         cluster_state['osds'][to_osd]['future_pgs_by_pool'].get(pool_id, 0) - 1
     cluster_state['upmap_queue'][pgid] = cluster_state['pgs'][pgid]['upmaps']
 
-def remove_under_target_mappings(cluster_state, logger):
-    logger.debug("Scanning for upmaps causing OSDs to be below their per-pool floor")
+def items_after_addition(upmaps, mapping):
+    """Return a PG's upmap items after adding mapping (from_osd, to_osd).
 
+    If from_osd is already the destination of an existing item, we'd produce
+    an invalid set like [(X, from_osd), (from_osd, to_osd)] — Ceph rejects
+    mappings where the same OSD appears as both source and destination.
+    Collapse the chain X -> from_osd -> to_osd into a single X -> to_osd
+    (or drop the item entirely when X == to_osd, since the redirect cancels).
+    """
+    from_osd, to_osd = mapping
+    items = list(upmaps)
+    chained = next((m for m in items if m[1] == from_osd), None)
+    if chained is not None:
+        items.remove(chained)
+        if chained[0] != to_osd:
+            items.append((chained[0], to_osd))
+    else:
+        items.append(mapping)
+    return items
+
+def count_upmap_roles(roles, pgid, items, sign):
+    pool_id = int(pgid.split('.')[0])
+    for from_osd, to_osd in items:
+        roles[(pool_id, to_osd)][0] += sign
+        roles[(pool_id, from_osd)][1] += sign
+
+def get_upmap_roles(cluster_state):
+    """(pool_id, osd_id) -> [upmap items moving data onto it, items moving data off it].
+
+    Built from the current upmaps on first use, then kept current by
+    queue_upmap_mapping_addition()/queue_upmap_mapping_removal().
+    """
+    roles = cluster_state.get('upmap_roles')
+    if roles is None:
+        roles = defaultdict(lambda: [0, 0])
+        for pgid, pg in cluster_state['pgs'].items():
+            count_upmap_roles(roles, pgid, pg['upmaps'], 1)
+        cluster_state['upmap_roles'] = roles
+    return roles
+
+def update_upmap_roles(cluster_state, pgid, old_items, new_items):
+    roles = cluster_state.get('upmap_roles')
+    if roles is None:
+        return
+    count_upmap_roles(roles, pgid, old_items, -1)
+    count_upmap_roles(roles, pgid, new_items, 1)
+
+def would_mix_roles(cluster_state, pgid, mapping):
+    """True if adding mapping would leave either OSD with upmaps moving data
+    both onto and off it in the PG's pool.
+
+    Such pairs just shuffle data through the OSD: X -> osd on one PG and
+    osd -> Y on another is better expressed as X -> Y. Moving a PG off an OSD
+    it was itself redirected onto is fine — the chain collapses (see
+    items_after_addition()), so the OSD loses that role rather than gaining one.
+    """
+    roles = get_upmap_roles(cluster_state)
+    pool_id = int(pgid.split('.')[0])
+    old_items = cluster_state['pgs'][pgid]['upmaps']
+    delta = defaultdict(lambda: [0, 0])
+    count_upmap_roles(delta, pgid, old_items, -1)
+    count_upmap_roles(delta, pgid, items_after_addition(old_items, mapping), 1)
+    for osd_id in mapping:
+        onto = roles[(pool_id, osd_id)][0] + delta[(pool_id, osd_id)][0]
+        off = roles[(pool_id, osd_id)][1] + delta[(pool_id, osd_id)][1]
+        if onto > 0 and off > 0:
+            return True
+    return False
+
+def rebuild_upmaps(cluster_state, logger):
+    """Simulate removing every upmap, then re-add only the existing ones that help.
+
+    Undoing each PG's upmap items (last first, the reverse of how Ceph applies
+    them) recovers the placement CRUSH computes without any upmaps. From there,
+    an existing item is kept only if it moves a PG from an OSD over its target
+    toward one under it, using the same test balance_off_target_osds() uses for
+    new moves, and doesn't leave an OSD with upmaps moving data both onto and
+    off it in the same pool. Items not kept are dropped, so their PGs go back
+    to where CRUSH puts them; balance_off_target_osds() then fills in the rest.
+    """
     osds = cluster_state['osds']
+    pgs = cluster_state['pgs']
 
-    for pgid, pg_info in cluster_state['pgs'].items():
-        pool_id = int(pgid.split('.')[0])
-        for from_osd, to_osd in list(pg_info['upmaps']):
-            from_floor = osds[from_osd]['target_pgs_by_pool'].get(pool_id, (0, 0))[0]
-            from_count = osds[from_osd]['future_pgs_by_pool'].get(pool_id, 0)
-            if from_count < from_floor:
-                logger.info(
-                    f"Removing under-target upmap {pgid}: ({from_osd} -> {to_osd}) "
-                    f"[from_count={from_count}/floor={from_floor}]"
-                )
+    # Undo every item. Ceph applies an item only if from_osd is in the set,
+    # to_osd isn't, and to_osd isn't out; one it skipped left the set alone,
+    # so there's nothing to undo — it's just dropped.
+    for pgid, pg in pgs.items():
+        pg['original_upmaps'] = list(pg['upmaps'])
+        pg['original_up'] = list(pg['up'])
+        for from_osd, to_osd in reversed(pg['original_upmaps']):
+            if to_osd in pg['up'] and from_osd not in pg['up'] and osds.get(to_osd, {}).get('in', 1):
                 queue_upmap_mapping_removal(cluster_state, pgid, (from_osd, to_osd), logger)
+            else:
+                logger.debug(f"Dropping inactive upmap {pgid}: ({from_osd} -> {to_osd})")
+                old_items = list(pg['upmaps'])
+                pg['upmaps'].remove((from_osd, to_osd))
+                update_upmap_roles(cluster_state, pgid, old_items, pg['upmaps'])
+                cluster_state['upmap_queue'][pgid] = pg['upmaps']
+    cluster_state['upmap_roles'] = None
+    get_upmap_roles(cluster_state)
+
+    rules = {}
+    for pool_id, pool in cluster_state['pools'].items():
+        rule = cluster_state['crush_rules'][pool['crush_rule']]
+        rules[pool_id] = (set(rule['valid_osds']),
+                          cluster_state['osd_bucket_maps'].get(get_rule_failure_domain(rule), {}))
+
+    def target(osd_id, pool_id):
+        return osds[osd_id]['target_pgs_by_pool'].get(pool_id, (0, 0))
+
+    def count(osd_id, pool_id):
+        return osds[osd_id]['future_pgs_by_pool'].get(pool_id, 0)
+
+    def is_helpful(pgid, from_osd, to_osd):
+        pool_id = int(pgid.split('.')[0])
+        valid_osds, bucket_map = rules[pool_id]
+        up = pgs[pgid]['up']
+        if to_osd not in valid_osds or from_osd not in up or to_osd in up:
+            return False
+        from_floor, from_ceil = target(from_osd, pool_id)
+        to_floor, to_ceil = target(to_osd, pool_id)
+        from_count, to_count = count(from_osd, pool_id), count(to_osd, pool_id)
+        # Both ends stay in range, and the move fixes an imbalance
+        if not (from_count > from_floor and to_count < to_ceil):
+            return False
+        if not (from_count > from_ceil or to_count < to_floor):
+            return False
+        peer_buckets = {bucket_map.get(o) for o in up if o != from_osd and o != CRUSH_ITEM_NONE}
+        if bucket_map.get(to_osd) in peer_buckets:
+            return False
+        return not would_mix_roles(cluster_state, pgid, (from_osd, to_osd))
+
+    def benefit(candidate):
+        pgid, (from_osd, to_osd) = candidate
+        pool_id = int(pgid.split('.')[0])
+        return ((count(from_osd, pool_id) - target(from_osd, pool_id)[1]) +
+                (target(to_osd, pool_id)[0] - count(to_osd, pool_id)))
+
+    # Keep the most helpful items first. Keeping one changes the counts, so
+    # make further passes until a pass keeps nothing.
+    candidates = [(pgid, m) for pgid, pg in pgs.items() for m in pg['original_upmaps']]
+    total = len(candidates)
+    while candidates:
+        candidates.sort(key=benefit, reverse=True)
+        remaining = []
+        for pgid, (from_osd, to_osd) in candidates:
+            if is_helpful(pgid, from_osd, to_osd):
+                logger.debug(f"Keeping existing upmap {pgid}: ({from_osd} -> {to_osd})")
+                queue_upmap_mapping_addition(cluster_state, pgid, (from_osd, to_osd), logger)
+            else:
+                remaining.append((pgid, (from_osd, to_osd)))
+        if len(remaining) == len(candidates):
+            break
+        candidates = remaining
+
+    logger.info(f"Kept {total - len(candidates)} of {total} existing upmap items")
+    for pgid, (from_osd, to_osd) in candidates:
+        logger.debug(f"Dropping existing upmap {pgid}: ({from_osd} -> {to_osd})")
 
 def queue_upmap_mapping_addition(cluster_state, pgid, mapping, logger):
     logger.debug(f"Queueing upmap mapping addition for {pgid}: Adding {mapping} to {cluster_state['pgs'][pgid]['upmaps']}")
@@ -520,20 +666,9 @@ def queue_upmap_mapping_addition(cluster_state, pgid, mapping, logger):
     per_osd_bytes = num_bytes if pool['type'] == 'replica' else num_bytes / pool['k']
 
     upmaps = cluster_state['pgs'][pgid]['upmaps']
-
-    # If from_osd is already the destination of an existing upmap, we'd produce
-    # an invalid set like [(X, from_osd), (from_osd, to_osd)] — Ceph rejects
-    # mappings where the same OSD appears as both source and destination.
-    # Collapse the chain X -> from_osd -> to_osd into a single X -> to_osd
-    # (or drop the upmap entirely when X == to_osd, since the redirect cancels).
-    chained = next((m for m in upmaps if m[1] == from_osd), None)
-    if chained is not None:
-        orig_from = chained[0]
-        upmaps.remove(chained)
-        if orig_from != to_osd:
-            upmaps.append((orig_from, to_osd))
-    else:
-        upmaps.append(mapping)
+    old_items = list(upmaps)
+    upmaps[:] = items_after_addition(upmaps, mapping)
+    update_upmap_roles(cluster_state, pgid, old_items, upmaps)
 
     # Reflect the new placement in the up set so subsequent iterations see it
     up = cluster_state['pgs'][pgid]['up']
@@ -562,6 +697,25 @@ def balance_off_target_osds(cluster_state, logger):
         failure_domain = get_rule_failure_domain(rule)
         valid_osds = set(rule['valid_osds'])
         bucket_map = cluster_state['osd_bucket_maps'].get(failure_domain, {})
+        pool_pgs = [(pgid, pg) for pgid, pg in cluster_state['pgs'].items()
+                    if pgid.startswith(f"{pool_id}.")]
+        # Set by rebuild_upmaps(): where each PG's shards are before this run
+        prefer_free = any('original_up' in pg for _, pg in pool_pgs)
+
+        def candidate_moves(from_osd, destinations):
+            """(pgid, pg, to_osd) moves off from_osd. When the PGs' starting up
+            sets are known, moves back onto an OSD that already holds the PG's
+            shard come first — they cost no data movement."""
+            for free_only in ((True, False) if prefer_free else (False,)):
+                for pgid, pg in pool_pgs:
+                    if from_osd not in pg['up']:
+                        continue
+                    for to_osd in destinations:
+                        if to_osd in pg['up']:
+                            continue
+                        if free_only and to_osd not in pg.get('original_up', ()):
+                            continue
+                        yield pgid, pg, to_osd
 
         while True:
             # Donors: OSDs whose count is strictly above their floor, so
@@ -595,38 +749,36 @@ def balance_off_target_osds(cluster_state, logger):
                 from_ceil = osds[from_osd]['target_pgs_by_pool'].get(pool_id, (0, 0))[1]
                 donor_is_over = from_count > from_ceil
 
-                for pgid, pg in cluster_state['pgs'].items():
-                    if not pgid.startswith(f"{pool_id}."):
+                for pgid, pg, to_osd in candidate_moves(from_osd, destinations):
+                    # Only commit a move that actually fixes an imbalance.
+                    # If the donor isn't over-ceil AND the recipient isn't
+                    # under-floor, both endpoints are already in range and
+                    # moving a PG between them just churns upmaps.
+                    to_count = osds[to_osd]['future_pgs_by_pool'].get(pool_id, 0)
+                    to_floor = osds[to_osd]['target_pgs_by_pool'].get(pool_id, (0, 0))[0]
+                    if not donor_is_over and to_count >= to_floor:
                         continue
-                    if from_osd not in pg['up']:
+                    to_bucket = bucket_map.get(to_osd)
+                    peer_buckets = {
+                        bucket_map.get(o) for o in pg['up']
+                        if o != from_osd and o != CRUSH_ITEM_NONE
+                    }
+                    if to_bucket in peer_buckets:
                         continue
-                    for to_osd in destinations:
-                        if to_osd in pg['up']:
-                            continue
-                        # Only commit a move that actually fixes an imbalance.
-                        # If the donor isn't over-ceil AND the recipient isn't
-                        # under-floor, both endpoints are already in range and
-                        # moving a PG between them just churns upmaps.
-                        to_count = osds[to_osd]['future_pgs_by_pool'].get(pool_id, 0)
-                        to_floor = osds[to_osd]['target_pgs_by_pool'].get(pool_id, (0, 0))[0]
-                        if not donor_is_over and to_count >= to_floor:
-                            continue
-                        to_bucket = bucket_map.get(to_osd)
-                        peer_buckets = {
-                            bucket_map.get(o) for o in pg['up']
-                            if o != from_osd and o != CRUSH_ITEM_NONE
-                        }
-                        if to_bucket in peer_buckets:
-                            continue
-                        logger.info(
-                            f"Adding balancing upmap {pgid}: ({from_osd} -> {to_osd}) "
-                            f"[pool={pool_id}]"
-                        )
-                        queue_upmap_mapping_addition(cluster_state, pgid, (from_osd, to_osd), logger)
-                        made_move = True
-                        break
-                    if made_move:
-                        break
+                    # An OSD that drain_to_at_ceil_osd() relayed a PG through
+                    # may pass a PG on while over its ceil, even though it
+                    # now has upmaps both onto and off it — that second hop
+                    # is what finishes the drain.
+                    relayed = donor_is_over and (pool_id, from_osd) in cluster_state.get('drain_relays', ())
+                    if not relayed and would_mix_roles(cluster_state, pgid, (from_osd, to_osd)):
+                        continue
+                    logger.info(
+                        f"Adding balancing upmap {pgid}: ({from_osd} -> {to_osd}) "
+                        f"[pool={pool_id}]"
+                    )
+                    queue_upmap_mapping_addition(cluster_state, pgid, (from_osd, to_osd), logger)
+                    made_move = True
+                    break
                 if made_move:
                     break
 
@@ -648,6 +800,11 @@ def drain_to_at_ceil_osd(cluster_state, pool_id, valid_osds, bucket_map, logger)
 
     This can't loop: it only ever moves PGs off ceil-0 OSDs, and normal moves
     never move PGs onto them (their count is never below a ceil of 0).
+
+    It deliberately ignores would_mix_roles(): the at-ceil OSD ends up with
+    upmaps moving data both onto and off it, but emptying a drained OSD wins.
+    The OSD is recorded in cluster_state['drain_relays'] so its follow-up move
+    is exempt too.
     """
     osds = cluster_state['osds']
 
@@ -682,6 +839,7 @@ def drain_to_at_ceil_osd(cluster_state, pool_id, valid_osds, bucket_map, logger)
                     f"[pool={pool_id}, to_count={count(to_osd)}/ceil={target(to_osd)[1]}]"
                 )
                 queue_upmap_mapping_addition(cluster_state, pgid, (from_osd, to_osd), logger)
+                cluster_state.setdefault('drain_relays', set()).add((pool_id, to_osd))
                 return True
 
     return False
@@ -690,8 +848,15 @@ def apply_upmap_queue(cluster, cluster_state, is_dryrun, logger):
     logger.debug("Applying upmap changes")
 
     upmap_queue = cluster_state['upmap_queue']
+    pgs = cluster_state.get('pgs', {})
     for pgid in upmap_queue:
         mappings = upmap_queue[pgid]
+        # rebuild_upmaps() touches every upmapped PG; skip the ones that ended
+        # up with exactly the items the cluster already has. Order doesn't
+        # matter: kept items never chain (that would mix roles on an OSD).
+        original = pgs.get(pgid, {}).get('original_upmaps')
+        if original is not None and sorted(mappings) == sorted(original):
+            continue
         if len(mappings) == 0:
             if is_dryrun:
                 print(f"ceph osd rm-pg-upmap-items {pgid}")

@@ -482,34 +482,96 @@ class TestQueueUpmapMappingRemoval:
         assert state["osds"][1]["future_usage"] == 0
 
 
-class TestRemoveUnderTargetMappings:
-    def test_removes_upmap_when_from_osd_below_floor(self, base_cluster_state, logger):
-        # Raise OSD 0's floor so its count (0) lands below it
-        base_cluster_state["osds"][0]["target_pgs_by_pool"][1] = (1, 2)
-        coral.remove_under_target_mappings(base_cluster_state, logger)
-        assert "1.0" in base_cluster_state["upmap_queue"]
+def make_state(targets, pgs, ins=None):
+    """Single replicated pool 1, one host per OSD, counts filled in by calculate_usage().
 
-    def test_leaves_queue_empty_when_from_osd_on_floor(self, base_cluster_state, logger):
-        coral.remove_under_target_mappings(base_cluster_state, logger)
-        assert "1.0" not in base_cluster_state["upmap_queue"]
+    targets: {osd: (floor, ceil)}; pgs: {pgid: (up, upmap_items)}.
+    """
+    state = {
+        "osds": {o: {"in": (ins or {}).get(o, 1), "size": 10 * GiB, "target_pgs_by_pool": {1: t}}
+                 for o, t in targets.items()},
+        "pgs": {pgid: {"up": list(up), "acting": list(up), "num_bytes": GiB, "upmaps": list(items)}
+                for pgid, (up, items) in pgs.items()},
+        "pools": {1: {"name": "p", "type": "replica", "crush_rule": 0, "pgs": len(pgs),
+                      "size": len(next(iter(pgs.values()))[0])}},
+        "crush_rules": {0: {"name": "r", "valid_osds": sorted(targets),
+                            "steps": [{"op": "take", "item_name": "default"},
+                                      {"op": "chooseleaf_firstn", "num": 0, "type": "host"},
+                                      {"op": "emit"}]}},
+        "osd_bucket_maps": {"host": {o: f"host{o}" for o in targets}},
+        "upmap_queue": {},
+    }
+    coral.calculate_usage(state, MagicMock())
+    return state
 
-    def test_ignores_to_osd_being_above_ceil(self, base_cluster_state, logger):
-        # OSD 1 over its ceil shouldn't trigger this function; only from-side counts
-        base_cluster_state["osds"][1]["future_pgs_by_pool"][1] = 5
-        coral.remove_under_target_mappings(base_cluster_state, logger)
-        assert "1.0" not in base_cluster_state["upmap_queue"]
 
-    def test_handles_osd_missing_from_target_map(self, base_cluster_state, logger):
-        # OSD 0 has no target entry — floor defaults to 0; count=0 is not below it
-        base_cluster_state["osds"][0]["target_pgs_by_pool"] = {}
-        coral.remove_under_target_mappings(base_cluster_state, logger)
-        assert "1.0" not in base_cluster_state["upmap_queue"]
+def pool_counts(state):
+    return {o: state["osds"][o]["future_pgs_by_pool"].get(1, 0) for o in state["osds"]}
 
-    def test_balance_after_removal_sees_restored_up_set(self, logger):
+
+class TestRebuildUpmaps:
+    def test_recovers_crush_placement_through_chained_items(self, logger):
+        # CRUSH gave [2, 1, 0]; (2 -> 3) then (1 -> 2) turned it into [3, 2, 0].
+        # Every OSD is in range without upmaps, so nothing is worth keeping.
+        state = make_state({0: (1, 1), 1: (1, 1), 2: (1, 1), 3: (0, 1)},
+                           {"1.0": ([3, 2, 0], [(2, 3), (1, 2)])})
+        coral.rebuild_upmaps(state, logger)
+        assert state["pgs"]["1.0"]["up"] == [2, 1, 0]
+        assert state["pgs"]["1.0"]["upmaps"] == []
+        assert state["upmap_queue"] == {"1.0": []}
+        assert pool_counts(state) == {0: 1, 1: 1, 2: 1, 3: 0}
+
+    def test_drops_item_ceph_never_applied(self, logger):
+        # (1 -> 3) targets an out OSD, so Ceph skipped it: up is CRUSH's [0, 1].
+        state = make_state({0: (1, 1), 1: (1, 1), 3: (0, 0)},
+                           {"1.0": ([0, 1], [(1, 3)])}, ins={3: 0})
+        coral.rebuild_upmaps(state, logger)
+        assert state["pgs"]["1.0"]["up"] == [0, 1]
+        assert state["pgs"]["1.0"]["upmaps"] == []
+        assert pool_counts(state) == {0: 1, 1: 1, 3: 0}
+
+    def test_keeps_helpful_upmap_and_does_not_resend_it(self, logger, capsys):
+        # Without upmaps OSD 2 would be empty (under its floor of 1); the
+        # existing (0 -> 2) fixes that, so it stays — and since the PG ends up
+        # with exactly the items it already has, nothing is sent.
+        state = make_state({0: (1, 2), 1: (1, 2), 2: (1, 2)},
+                           {"1.0": ([2, 1], [(0, 2)]), "1.1": ([0, 1], [])})
+        coral.rebuild_upmaps(state, logger)
+        assert state["pgs"]["1.0"]["upmaps"] == [(0, 2)]
+        assert state["pgs"]["1.0"]["up"] == [2, 1]
+        coral.apply_upmap_queue(MagicMock(), state, is_dryrun=True, logger=logger)
+        assert capsys.readouterr().out == ""
+
+    def test_drops_upmap_that_would_leave_source_under_floor(self, logger):
+        # OSD 0 needs both of its CRUSH PGs (floor 2), so (0 -> 2) is dropped
+        # and PG 1.0 goes back to OSD 0.
+        state = make_state({0: (2, 2), 1: (2, 2), 2: (0, 0)},
+                           {"1.0": ([2, 1], [(0, 2)]), "1.1": ([0, 1], [])})
+        coral.rebuild_upmaps(state, logger)
+        assert state["pgs"]["1.0"]["upmaps"] == []
+        assert state["pgs"]["1.0"]["up"] == [0, 1]
+        assert state["upmap_queue"] == {"1.0": []}
+
+    def test_does_not_keep_upmaps_moving_data_onto_and_off_one_osd(self, logger):
+        # Existing upmaps (0 -> 2) on 1.0 and (2 -> 4) on 1.1 shuffle data
+        # through OSD 2. The rebuild keeps (0 -> 2), refuses (2 -> 4), and the
+        # balancer then fills OSD 4 by collapsing 1.0's chain into (0 -> 4).
+        state = make_state({0: (0, 0), 1: (1, 1), 2: (1, 2), 3: (1, 1), 4: (1, 1)},
+                           {"1.0": ([2, 1], [(0, 2)]), "1.1": ([4, 3], [(2, 4)])})
+        coral.rebuild_upmaps(state, logger)
+        assert state["pgs"]["1.0"]["upmaps"] == [(0, 2)]
+        assert state["pgs"]["1.1"]["upmaps"] == []
+        coral.balance_off_target_osds(state, logger)
+        assert state["pgs"]["1.0"]["upmaps"] == [(0, 4)]
+        assert state["pgs"]["1.1"]["upmaps"] == []
+        assert pool_counts(state) == {0: 0, 1: 1, 2: 1, 3: 1, 4: 1}
+
+    def test_balance_after_rebuild_sees_restored_up_set(self, logger):
         # PG 1.0's CRUSH set is [0, 2], redirected to [1, 2] by upmap (0 -> 1).
-        # osd.0 is under its floor, so the upmap is removed. The balancer must
-        # then plan against up=[0, 2]; with a stale up=[1, 2] it would queue a
-        # bogus (2 -> 0) that Ceph ignores because osd.0 is already in the PG.
+        # Keeping it would leave osd.0 under its floor, so it's dropped. The
+        # balancer must then plan against up=[0, 2]; with a stale up=[1, 2] it
+        # would queue a bogus (2 -> 0) that Ceph ignores because osd.0 is
+        # already in the PG.
         osds = {i: {"in": 1, "crush_weight": 1.0} for i in range(3)}
         pgs = {
             "1.0": {"up": [1, 2], "acting": [1, 2], "num_bytes": 1, "upmaps": [(0, 1)]},
@@ -526,7 +588,7 @@ class TestRemoveUnderTargetMappings:
         }
         coral.calculate_pg_distribution(state, logger)
         coral.calculate_usage(state, logger)
-        coral.remove_under_target_mappings(state, logger)
+        coral.rebuild_upmaps(state, logger)
         coral.balance_off_target_osds(state, logger)
 
         for pgid, pg in pgs.items():
@@ -538,12 +600,6 @@ class TestRemoveUnderTargetMappings:
         for osd_id in osds:
             actual = sum(osd_id in pg["up"] for pg in pgs.values())
             assert osds[osd_id]["future_pgs_by_pool"][1] == actual == 2
-
-    def test_recalculates_counts_after_removal(self, base_cluster_state, logger):
-        base_cluster_state["osds"][0]["target_pgs_by_pool"][1] = (1, 2)
-        coral.remove_under_target_mappings(base_cluster_state, logger)
-        assert base_cluster_state["osds"][0]["future_pgs_by_pool"][1] == 1
-        assert base_cluster_state["osds"][1]["future_pgs_by_pool"][1] == 0
 
 
 class TestQueueUpmapMappingAddition:
