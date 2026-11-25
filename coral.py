@@ -96,11 +96,19 @@ def setup_logging(log_file, is_preview=False):
 
     return logger
 
+def get_pg_dump(cluster):
+    cmd = {'prefix': 'pg dump', 'format': 'json'}
+    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
+    return json.loads(output.decode('utf-8'))
+
 def get_cluster_state(cluster, logger):
+    # 'pg dump' is by far the largest query, so fetch it once for both of its users
+    pg_dump = get_pg_dump(cluster)
+
     # Gather the data we need
     cluster_state = {}
-    cluster_state['osds'] = get_osd_info(cluster, logger)
-    cluster_state['pgs'] = get_pg_info(cluster, logger)
+    cluster_state['osds'] = get_osd_info(cluster, logger, pg_dump)
+    cluster_state['pgs'] = get_pg_info(cluster, logger, pg_dump)
     cluster_state['pools'] = get_pool_info(cluster, logger)
     cluster_state['crush_rules'] = get_crush_rules(cluster, logger)
     cluster_state['osd_bucket_maps'] = get_osd_bucket_maps(cluster, logger)
@@ -112,7 +120,7 @@ def get_cluster_state(cluster, logger):
     # Return the cluster information
     return cluster_state
 
-def get_osd_info(cluster, logger):
+def get_osd_info(cluster, logger, pg_dump=None):
     osd_info = {}
 
     logger.debug("Gathering info for OSDs")
@@ -129,25 +137,36 @@ def get_osd_info(cluster, logger):
             'in': osd['in']
         }
 
-    # Get the CRUSH weight, size, and device class from 'osd df'
-    cmd = {'prefix': 'osd df', 'format': 'json'}
+    # Get the CRUSH weight and device class from the OSD nodes of the CRUSH
+    # tree. The --show-shadow tree lists each OSD once per tree it's in, with
+    # the same values each time.
+    cmd = {'prefix': 'osd crush tree', 'shadow': '--show-shadow', 'format': 'json'}
     ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
-    osd_df = json.loads(output.decode('utf-8'))
+    crush_tree = json.loads(output.decode('utf-8'))
 
-    for osd in osd_df['nodes']:
-        osd_info[osd['id']]['crush_weight'] = osd['crush_weight']
-        osd_info[osd['id']]['size'] = osd['kb'] * 1024
-        osd_info[osd['id']]['device_class'] = osd['device_class']
+    # Get each OSD's size from the per-OSD stats in 'pg dump'. An OSD that
+    # hasn't reported stats (e.g. down since the mgr started) has no entry;
+    # treat it as size 0.
+    if pg_dump is None:
+        pg_dump = get_pg_dump(cluster)
+    osd_kb = {s['osd']: s['kb'] for s in pg_dump['pg_map'].get('osd_stats', [])}
+
+    for node in crush_tree.get('nodes', []):
+        if node.get('type') != 'osd':
+            continue
+        osd_id = node['id']
+        osd_info[osd_id]['crush_weight'] = node['crush_weight']
+        osd_info[osd_id]['size'] = osd_kb.get(osd_id, 0) * 1024
+        osd_info[osd_id]['device_class'] = node.get('device_class', '')
 
     return osd_info
 
-def get_pg_info(cluster, logger):
+def get_pg_info(cluster, logger, pg_dump=None):
     logger.debug("Gathering info for PGs")
 
     # Grab the up/acting sets, state, and size for each PG
-    cmd = {'prefix': 'pg dump', 'format': 'json'}
-    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
-    pg_dump = json.loads(output.decode('utf-8'))
+    if pg_dump is None:
+        pg_dump = get_pg_dump(cluster)
 
     pg_info = {}
     for pg in pg_dump['pg_map']['pg_stats']:

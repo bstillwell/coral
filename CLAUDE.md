@@ -37,7 +37,8 @@ No Ceph cluster required — `rados` is mocked via `sys.modules` in `tests/conft
 All state lives in a single `cluster_state` dict built by `get_cluster_state()`, which calls:
 
 ```
-get_osd_info()        → osds: up/in/crush_weight/size/device_class
+get_pg_dump()         → raw 'pg dump' (the largest query), fetched once and passed to the next two
+get_osd_info()        → osds: up/in (osd dump), crush_weight/device_class (crush tree), size (pg dump osd_stats)
 get_pg_info()         → pgs: up/acting sets, num_bytes, existing upmaps
 get_pool_info()       → pools: type (replica|erasure), crush_rule, k/m for EC
 get_crush_rules()     → crush_rules: rule steps, valid_osds (OSDs the rule can target, resolved via the recursive get_osds_in_bucket() helper)

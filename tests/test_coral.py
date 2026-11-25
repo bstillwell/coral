@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import coral
-from conftest import make_mock_cluster, GiB, OSD_DUMP, POOLS_EC
+from conftest import make_mock_cluster, GiB, OSD_DUMP, POOLS_EC, PG_DUMP, CRUSH_TREE
 
 
 class TestGetRuleFailureDomain:
@@ -55,6 +55,39 @@ class TestGetOsdInfo:
     def test_crush_weight(self, mock_cluster, logger):
         result = coral.get_osd_info(mock_cluster, logger)
         assert result[0]["crush_weight"] == 1.0
+
+    def test_osd_without_stats_has_zero_size(self, logger):
+        pg_dump = {"pg_map": {**PG_DUMP["pg_map"], "osd_stats": [{"osd": 0, "kb": 1024}]}}
+        cluster = make_mock_cluster({"pg dump": pg_dump})
+        result = coral.get_osd_info(cluster, logger)
+        assert result[0]["size"] == 1024 * 1024
+        assert result[1]["size"] == 0
+
+    def test_osd_listed_in_several_shadow_trees(self, logger):
+        tree = {"nodes": CRUSH_TREE["nodes"] + [
+            {"id": -10, "name": "default~hdd", "type": "root", "children": [-11]},
+            {"id": -11, "name": "host0~hdd", "type": "host", "children": [0]},
+            {"id": 0, "name": "osd.0", "type": "osd", "children": [], "crush_weight": 1.0, "device_class": "hdd"},
+        ]}
+        cluster = make_mock_cluster({"osd crush tree": tree})
+        result = coral.get_osd_info(cluster, logger)
+        assert result[0]["crush_weight"] == 1.0
+        assert result[0]["device_class"] == "hdd"
+
+    def test_uses_given_pg_dump(self, mock_cluster, logger):
+        pg_dump = {"pg_map": {"pg_stats": [], "osd_stats": [{"osd": 0, "kb": 7}, {"osd": 1, "kb": 7}]}}
+        result = coral.get_osd_info(mock_cluster, logger, pg_dump)
+        assert result[0]["size"] == 7 * 1024
+        prefixes = [json.loads(c.args[0])["prefix"] for c in mock_cluster.mon_command.call_args_list]
+        assert "pg dump" not in prefixes
+        assert "osd df" not in prefixes
+
+
+class TestGetClusterState:
+    def test_fetches_pg_dump_once(self, mock_cluster, logger):
+        coral.get_cluster_state(mock_cluster, logger)
+        prefixes = [json.loads(c.args[0])["prefix"] for c in mock_cluster.mon_command.call_args_list]
+        assert prefixes.count("pg dump") == 1
 
 
 class TestGetPgInfo:

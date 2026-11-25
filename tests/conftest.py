@@ -24,13 +24,6 @@ OSD_DUMP = {
     ],
 }
 
-OSD_DF = {
-    "nodes": [
-        {"id": 0, "crush_weight": 1.0, "kb": 10 * 1024 * 1024, "device_class": "hdd"},
-        {"id": 1, "crush_weight": 1.0, "kb": 10 * 1024 * 1024, "device_class": "hdd"},
-    ]
-}
-
 PG_DUMP = {
     "pg_map": {
         "pg_stats": [
@@ -41,7 +34,11 @@ PG_DUMP = {
                 "state": "active+backfilling",
                 "stat_sum": {"num_bytes": GiB},
             }
-        ]
+        ],
+        "osd_stats": [
+            {"osd": 0, "kb": 10 * 1024 * 1024},
+            {"osd": 1, "kb": 10 * 1024 * 1024},
+        ],
     }
 }
 
@@ -77,8 +74,8 @@ CRUSH_TREE = {
         {"id": -1, "name": "default", "type": "root", "children": [-2, -3]},
         {"id": -2, "name": "host0", "type": "host", "children": [0]},
         {"id": -3, "name": "host1", "type": "host", "children": [1]},
-        {"id": 0, "name": "osd.0", "type": "osd", "children": []},
-        {"id": 1, "name": "osd.1", "type": "osd", "children": []},
+        {"id": 0, "name": "osd.0", "type": "osd", "children": [], "crush_weight": 1.0, "device_class": "hdd"},
+        {"id": 1, "name": "osd.1", "type": "osd", "children": [], "crush_weight": 1.0, "device_class": "hdd"},
     ]
 }
 
@@ -86,7 +83,6 @@ CRUSH_TREE = {
 def make_mock_cluster(overrides=None):
     responses = {
         "osd dump": OSD_DUMP,
-        "osd df": OSD_DF,
         "pg dump": PG_DUMP,
         "osd erasure-code-profile get": EC_PROFILE,
         "osd crush rule dump": CRUSH_RULE_DUMP,
