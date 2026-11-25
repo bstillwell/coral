@@ -166,16 +166,23 @@ def get_osd_info(cluster, logger, pg_dump=None):
         pg_dump = get_pg_dump(cluster)
     osd_stats = {s['osd']: s for s in pg_dump['pg_map'].get('osd_stats', [])}
 
+    # An OSD can be in the OSD map without a CRUSH location (e.g. destroyed
+    # and unlinked from CRUSH but not yet removed), or in CRUSH but missing
+    # from the OSD map. Give every OSD the same fields either way: no CRUSH
+    # location means weight 0 and no device class.
+    crush_osds = {}
     for node in crush_tree.get('nodes', []):
-        if node.get('type') != 'osd':
-            continue
-        osd_id = node['id']
+        if node.get('type') == 'osd':
+            crush_osds[node['id']] = node
+    for osd_id in set(osd_info) | set(crush_osds):
+        info = osd_info.setdefault(osd_id, {'up': 0, 'in': 0})
+        node = crush_osds.get(osd_id, {})
         stats = osd_stats.get(osd_id, {})
-        osd_info[osd_id]['crush_weight'] = node['crush_weight']
-        osd_info[osd_id]['size'] = stats.get('kb', 0) * 1024
+        info['crush_weight'] = node.get('crush_weight', 0.0)
+        info['size'] = stats.get('kb', 0) * 1024
         if 'kb_used' in stats:
-            osd_info[osd_id]['used'] = stats['kb_used'] * 1024
-        osd_info[osd_id]['device_class'] = node.get('device_class', '')
+            info['used'] = stats['kb_used'] * 1024
+        info['device_class'] = node.get('device_class', '')
 
     return osd_info
 

@@ -1,4 +1,5 @@
 import json
+import re
 from unittest.mock import MagicMock
 import pytest
 
@@ -73,6 +74,26 @@ class TestGetOsdInfo:
         result = coral.get_osd_info(cluster, logger)
         assert result[0]["crush_weight"] == 1.0
         assert result[0]["device_class"] == "hdd"
+
+    def test_osd_without_crush_location(self, logger):
+        # osd.2 is in the OSD map (down/out) but was unlinked from CRUSH
+        osd_dump = {**OSD_DUMP, "osds": OSD_DUMP["osds"] + [{"osd": 2, "up": 0, "in": 0}]}
+        result = coral.get_osd_info(make_mock_cluster({"osd dump": osd_dump}), logger)
+        assert result[2] == {"up": 0, "in": 0, "crush_weight": 0.0, "size": 0, "device_class": ""}
+
+    def test_osd_in_crush_but_not_osd_map(self, logger):
+        tree = {"nodes": CRUSH_TREE["nodes"] + [
+            {"id": 3, "name": "osd.3", "type": "osd", "children": [], "crush_weight": 1.0, "device_class": "hdd"}]}
+        result = coral.get_osd_info(make_mock_cluster({"osd crush tree": tree}), logger)
+        assert result[3]["in"] == 0 and result[3]["crush_weight"] == 1.0
+
+    def test_display_handles_osd_without_crush_location(self, logger, capsys):
+        osd_dump = {**OSD_DUMP, "osds": OSD_DUMP["osds"] + [{"osd": 2, "up": 0, "in": 0}]}
+        state = coral.get_cluster_state(make_mock_cluster({"osd dump": osd_dump}), logger)
+        coral.calculate_usage(state, logger)
+        coral.display_usage(state)
+        coral.display_pgs_by_pool(state)
+        assert re.search(r"│\s*2\s*│", capsys.readouterr().out)    # osd.2's row in the usage table
 
     def test_uses_given_pg_dump(self, mock_cluster, logger):
         pg_dump = {"pg_map": {"pg_stats": [], "osd_stats": [{"osd": 0, "kb": 7}, {"osd": 1, "kb": 7}]}}
