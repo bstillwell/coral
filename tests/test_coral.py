@@ -530,17 +530,16 @@ class TestRebuildUpmaps:
         assert state["pgs"]["1.0"]["upmaps"] == []
         assert pool_counts(state) == {0: 1, 1: 1, 3: 0}
 
-    def test_keeps_helpful_upmap_and_does_not_resend_it(self, logger, capsys):
+    def test_keeps_helpful_upmap_and_does_not_resend_it(self, logger):
         # Without upmaps OSD 2 would be empty (under its floor of 1); the
         # existing (0 -> 2) fixes that, so it stays — and since the PG ends up
-        # with exactly the items it already has, nothing is sent.
+        # with exactly the items it already has, it isn't part of the plan.
         state = make_state({0: (1, 2), 1: (1, 2), 2: (1, 2)},
                            {"1.0": ([2, 1], [(0, 2)]), "1.1": ([0, 1], [])})
         coral.rebuild_upmaps(state, logger)
         assert state["pgs"]["1.0"]["upmaps"] == [(0, 2)]
         assert state["pgs"]["1.0"]["up"] == [2, 1]
-        coral.apply_upmap_queue(MagicMock(), state, is_dryrun=True, logger=logger)
-        assert capsys.readouterr().out == ""
+        assert coral.build_upmap_plan(state) == {}
 
     def test_drops_upmap_that_would_leave_source_under_floor(self, logger):
         # OSD 0 needs both of its CRUSH PGs (floor 2), so (0 -> 2) is dropped
@@ -887,46 +886,196 @@ class TestBalanceOffTargetOsds:
         assert "1.0" not in state["upmap_queue"]
 
 
-class TestApplyUpmapQueue:
+class TestSendUpmapItems:
     @staticmethod
-    def _mock_cluster():
+    def _mock_cluster(ret=0):
         cluster = MagicMock()
-        cluster.mon_command.return_value = (0, b'', b'')
+        cluster.mon_command.return_value = (ret, b'', 'error' if ret else '')
         return cluster
 
     def test_pg_upmap_items_command_sends_integer_ids(self, logger):
         cluster = self._mock_cluster()
-        state = {"upmap_queue": {"1.0": [(0, 1)]}}
-        coral.apply_upmap_queue(cluster, state, False, logger)
-        cmd_json = cluster.mon_command.call_args.args[0]
-        cmd = json.loads(cmd_json)
-        assert cmd == {
-            "prefix": "osd pg-upmap-items",
-            "pgid": "1.0",
-            "id": [0, 1],
-            "format": "json",
-        }
+        assert coral.send_upmap_items(cluster, "1.0", [(0, 1)], False, logger)
+        cmd = json.loads(cluster.mon_command.call_args.args[0])
+        assert cmd == {"prefix": "osd pg-upmap-items", "pgid": "1.0", "id": [0, 1], "format": "json"}
         assert all(isinstance(i, int) for i in cmd["id"])
 
     def test_rm_pg_upmap_items_command_for_empty_mapping(self, logger):
         cluster = self._mock_cluster()
-        state = {"upmap_queue": {"1.0": []}}
-        coral.apply_upmap_queue(cluster, state, False, logger)
-        cmd_json = cluster.mon_command.call_args.args[0]
-        cmd = json.loads(cmd_json)
-        assert cmd == {
-            "prefix": "osd rm-pg-upmap-items",
-            "pgid": "1.0",
-            "format": "json",
-        }
+        coral.send_upmap_items(cluster, "1.0", [], False, logger)
+        cmd = json.loads(cluster.mon_command.call_args.args[0])
+        assert cmd == {"prefix": "osd rm-pg-upmap-items", "pgid": "1.0", "format": "json"}
 
     def test_dryrun_prints_string_form(self, logger, capsys):
         cluster = self._mock_cluster()
-        state = {"upmap_queue": {"1.0": [(0, 1), (2, 3)]}}
-        coral.apply_upmap_queue(cluster, state, True, logger)
-        out = capsys.readouterr().out
-        assert "ceph osd pg-upmap-items 1.0 0 1 2 3" in out
+        coral.send_upmap_items(cluster, "1.0", [(0, 1), (2, 3)], True, logger)
+        assert "ceph osd pg-upmap-items 1.0 0 1 2 3" in capsys.readouterr().out
         cluster.mon_command.assert_not_called()
+
+    def test_reports_failure(self, logger):
+        assert not coral.send_upmap_items(self._mock_cluster(ret=-22), "1.0", [(0, 1)], False, logger)
+        logger.error.assert_called_once()
+
+
+def all_in(osd_id):
+    return True
+
+
+class TestUpmapItemHelpers:
+    def test_apply_matches_ceph_rules(self):
+        # (5 -> 6) skipped: 6 is already in the set; (9 -> 7) skipped: 9 isn't
+        assert coral.apply_upmap_items([1, 2, 6], [(1, 3), (5, 6), (9, 7)], all_in) == [3, 2, 6]
+        # target marked out: skipped
+        assert coral.apply_upmap_items([1, 2], [(1, 3)], lambda o: o != 3) == [1, 2]
+
+    def test_unapply_reverses_a_chain(self):
+        # CRUSH [2, 1, 0] -> (2 -> 3) -> [3, 1, 0] -> (1 -> 2) -> [3, 2, 0]
+        assert coral.unapply_upmap_items([3, 2, 0], [(2, 3), (1, 2)], all_in) == [2, 1, 0]
+
+    def test_items_for_up_orders_items_so_each_applies(self):
+        # Position 1 needs 0 (CRUSH's OSD at position 0), so position 0 must move first
+        items = coral.items_for_up([0, 1], [5, 0], all_in)
+        assert items == [(0, 5), (1, 0)]
+        assert coral.apply_upmap_items([0, 1], items, all_in) == [5, 0]
+
+    def test_items_for_up_refuses_a_swap(self):
+        assert coral.items_for_up([0, 1], [1, 0], all_in) is None
+
+    def test_next_step_changes_one_shard(self):
+        # 3-shard EC PG moving every shard: the first step moves only shard 0
+        raw, target = [0, 1, 2], [3, 4, 5]
+        items = coral.next_upmap_step(raw, [0, 1, 2], target, all_in)
+        assert coral.apply_upmap_items(raw, items, all_in) == [3, 1, 2]
+
+    def test_next_step_waits_for_position_holding_its_target(self):
+        # Target puts OSD 1 at position 0, but OSD 1 is still at position 1
+        # (moving to 4): position 1 has to go first.
+        raw = [0, 1, 2]
+        items = coral.next_upmap_step(raw, [0, 1, 2], [1, 4, 2], all_in)
+        assert coral.apply_upmap_items(raw, items, all_in) == [0, 4, 2]
+
+    def test_next_step_can_restore_crush_placement(self):
+        # Dropping an item is a single-shard step too
+        raw = [0, 1]
+        items = coral.next_upmap_step(raw, [5, 6], [0, 6], all_in)
+        assert items == [(1, 6)]
+
+
+def stepping_pg(up, acting=None, state="active+clean", upmaps=()):
+    return {"up": list(up), "acting": list(acting if acting is not None else up),
+            "state": state.split("+"), "upmaps": list(upmaps), "num_bytes": GiB}
+
+
+class TestApplyUpmapRound:
+    def test_one_shard_per_settled_pg(self, logger):
+        cluster = MagicMock()
+        cluster.mon_command.return_value = (0, b'', '')
+        pgs = {
+            "1.0": stepping_pg([0, 1, 2]),
+            "1.1": stepping_pg([0, 1, 2], acting=[0, 1, 9], state="active+remapped+backfilling"),
+            "1.2": stepping_pg([0, 1, 2], state="active+clean+remapped"),
+            "1.3": stepping_pg([3, 4, 5], upmaps=[(0, 3), (1, 4), (2, 5)]),   # already there
+        }
+        plan = {pgid: [3, 4, 5] for pgid in pgs}
+        started, remaining = coral.apply_upmap_round(cluster, plan, pgs, all_in, False, logger)
+        assert (started, remaining) == (1, 3)
+        cmd = json.loads(cluster.mon_command.call_args.args[0])
+        assert cmd["pgid"] == "1.0" and cmd["id"] == [0, 3]
+
+    def test_drops_dead_items_once_placement_is_right(self, logger):
+        cluster = MagicMock()
+        cluster.mon_command.return_value = (0, b'', '')
+        # (7 -> 8) never applied (7 isn't in the PG); placement already matches
+        pgs = {"1.0": stepping_pg([3, 1], upmaps=[(0, 3), (7, 8)])}
+        started, remaining = coral.apply_upmap_round(cluster, {"1.0": [3, 1]}, pgs, all_in, False, logger)
+        assert (started, remaining) == (1, 1)
+        assert json.loads(cluster.mon_command.call_args.args[0])["id"] == [0, 3]
+
+
+class FakeSteppingCluster:
+    """Answers osd dump / pg dump and applies pg-upmap-items. A PG whose items
+    change backfills for one round, then settles."""
+
+    def __init__(self, raw, upmaps=None, size=3):
+        self.raw = raw
+        self.upmaps = {pgid: list(upmaps.get(pgid, [])) for pgid in raw} if upmaps else {pgid: [] for pgid in raw}
+        self.backfilling = set()
+        self.weight = 1
+        self.commands = []
+
+    def up(self, pgid):
+        return coral.apply_upmap_items(self.raw[pgid], self.upmaps[pgid], all_in)
+
+    def mon_command(self, cmd_json, inbuf, timeout=5):
+        cmd = json.loads(cmd_json)
+        prefix = cmd["prefix"]
+        if prefix == "osd dump":
+            return 0, json.dumps({
+                "crush_version": 1,
+                "osds": [{"osd": o, "up": 1, "in": 1, "weight": self.weight} for o in range(12)],
+                "pools": [{"pool": 1, "pg_num": len(self.raw), "size": 3, "crush_rule": 0}],
+                "pg_upmap_items": [{"pgid": pgid, "mappings": [{"from": f, "to": t} for f, t in items]}
+                                   for pgid, items in self.upmaps.items() if items],
+            }).encode(), ""
+        if prefix == "pg dump":
+            stats = []
+            for pgid in self.raw:
+                busy = pgid in self.backfilling
+                stats.append({"pgid": pgid, "up": self.up(pgid),
+                              "acting": [] if busy else self.up(pgid),
+                              "state": "active+remapped+backfilling" if busy else "active+clean",
+                              "stat_sum": {"num_bytes": 1}})
+            self.backfilling = set()   # everything finishes by the next round
+            return 0, json.dumps({"pg_map": {"pg_stats": stats}}).encode(), ""
+        if prefix in ("osd pg-upmap-items", "osd rm-pg-upmap-items"):
+            ids = cmd.get("id", [])
+            before = self.up(cmd["pgid"])
+            self.upmaps[cmd["pgid"]] = list(zip(ids[::2], ids[1::2]))
+            self.commands.append((cmd["pgid"], before, self.up(cmd["pgid"])))
+            self.backfilling.add(cmd["pgid"])
+            return 0, b"", ""
+        raise AssertionError(prefix)
+
+
+class TestRunUpmapPlan:
+    def test_moves_one_shard_per_pg_per_round_until_done(self, logger):
+        fake = FakeSteppingCluster({"1.0": [0, 1, 2], "1.1": [3, 4, 5]},
+                                   upmaps={"1.1": [(3, 9)]})
+        plan = {"1.0": [6, 7, 8], "1.1": [3, 10, 5]}
+        fingerprint = coral.plan_fingerprint(json.loads(fake.mon_command('{"prefix": "osd dump"}', b"")[1]))
+        sleeps = []
+        result = coral.run_upmap_plan(fake, plan, fingerprint, 60, logger, sleep=sleeps.append)
+
+        assert result == "done"
+        assert fake.up("1.0") == [6, 7, 8] and fake.up("1.1") == [3, 10, 5]
+        # every command moved exactly one shard
+        for pgid, before, after in fake.commands:
+            assert sum(a != b for a, b in zip(before, after)) == 1, (pgid, before, after)
+        # 1.0 needs 3 single-shard steps; 1.1 needs 2 (drop 3 -> 9, then 4 -> 10).
+        # A PG backfills for a round after each step, so 1.0 takes rounds 1, 3, 5.
+        assert sum(1 for c in fake.commands if c[0] == "1.0") == 3
+        assert sum(1 for c in fake.commands if c[0] == "1.1") == 2
+        assert sleeps and set(sleeps) == {60}
+
+    def test_replans_when_the_cluster_changes(self, logger):
+        fake = FakeSteppingCluster({"1.0": [0, 1, 2]})
+        fingerprint = coral.plan_fingerprint(json.loads(fake.mon_command('{"prefix": "osd dump"}', b"")[1]))
+        fake.weight = 0.5   # someone reweighted an OSD
+        assert coral.run_upmap_plan(fake, {"1.0": [6, 7, 8]}, fingerprint, 60, logger, sleep=lambda s: None) == "replan"
+        assert fake.commands == []
+
+
+class TestPrintUpmapPlan:
+    def test_prints_first_round_and_summary(self, logger, capsys):
+        state = make_state({0: (0, 0), 1: (1, 1), 2: (0, 1), 3: (1, 1)},
+                           {"1.0": ([0, 1], [])})
+        state["pgs"]["1.0"]["state"] = ["active", "clean"]
+        state["pgs"]["1.0"]["original_up"] = [0, 1]
+        state["pgs"]["1.0"]["original_upmaps"] = []
+        coral.print_upmap_plan(state, {"1.0": [3, 2]}, 60, logger)
+        out = capsys.readouterr().out
+        assert "ceph osd pg-upmap-items 1.0 0 3" in out
+        assert "1 PG(s) to change (2 shard move(s) in total)" in out
 
 
 class TestDisplayUsage:

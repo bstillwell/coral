@@ -11,13 +11,14 @@ Coral (Clyso Optimized RebALancer) is a Ceph cluster rebalancing tool. It analyz
 ## Usage
 
 ```
-./coral.py [--preview] [--apply] [--preview-pgs]
+./coral.py [--preview] [--apply [--interval SECONDS]] [--preview-pgs]
 ```
 
 | Flag | Behavior |
 |------|----------|
-| _(none)_ | Default: dry-run. Connect to the cluster, compute the changes, and print the `ceph osd pg-upmap-items` / `ceph osd rm-pg-upmap-items` commands that would be run. Logs to `/var/log/ceph/coral.log`. |
-| `--apply` | Actually push the upmap changes to the cluster. |
+| _(none)_ | Default: dry-run. Connect to the cluster, compute the changes, print the first round of `ceph osd pg-upmap-items` / `ceph osd rm-pg-upmap-items` commands that `--apply` would send, and summarize how many PGs and shard moves remain. Logs to `/var/log/ceph/coral.log`. |
+| `--apply` | Push the changes to the cluster one shard per PG at a time. Every `--interval` seconds, each PG that is active+clean and not yet at its target gets its next single-shard change. Runs until every PG is at its target; re-plans if OSDs, weights, pools or the CRUSH map change; Ctrl-C stops it between rounds. |
+| `--interval` | Seconds between rounds with `--apply` (default 60). |
 | `--preview` | Show current and future OSD usage based on existing PG up/acting sets only — no rebalancing computation, no cluster writes, no log file writes. |
 | `--preview-pgs` | After the usage table, also print a per-OSD breakdown of future PGs by pool with their target floor/ceil. |
 
@@ -25,9 +26,10 @@ Coral (Clyso Optimized RebALancer) is a Ceph cluster rebalancing tool. It analyz
 
 1. **Gather cluster state** — OSD capacity and status, PG placement (acting and up sets), pool metadata, CRUSH rules (including the set of OSDs each rule can target), and the cluster `backfillfull_ratio`. Per-OSD min/max PG targets for each pool are also derived from each OSD's CRUSH-weight share among the rule's eligible OSDs, scaled by `pg_num` and pool size.
 2. **Calculate usage** — for each OSD, sum the data it holds today (acting set) and where it will land after backfill completes (up set). Erasure-coded pools distribute `num_bytes / k` per OSD; replica pools distribute the full `num_bytes`.
-3. **Balance off-target OSDs** — for each pool, the most over-target OSD has one of its PGs redirected (via a new `pg-upmap-items` entry) to the most under-target OSD that the pool's CRUSH rule allows and that doesn't collide on failure domain with the PG's other replicas. Repeats until no valid moves remain for the pool.
-4. **Apply changes** — the queued upmap modifications are sent to the MON via RADOS.
+3. **Rebuild existing upmaps** — undo every existing `pg_upmap_items` entry to recover the placement CRUSH computes on its own, then keep only the entries that move a PG from an over-target OSD toward an under-target one. No OSD is left with upmaps moving data both onto and off it in the same pool.
+4. **Balance off-target OSDs** — for each pool, the most over-target OSD has one of its PGs redirected (via a new `pg-upmap-items` entry) to the most under-target OSD that the pool's CRUSH rule allows and that doesn't collide on failure domain with the PG's other replicas. Repeats until no valid moves remain for the pool.
 5. **Display results** — a color-coded table shows each OSD's size, current usage, future usage, and the delta.
+6. **Apply changes** — one shard per PG at a time. All of a PG's backfill flows through its primary OSD, and the PG holds a backfill reservation on the primary and every target OSD until the whole PG is done, so moving every shard of a wide EC PG at once is slow and blocks other PGs on those OSDs. Instead, each round sends every settled PG the upmap items for its next single-shard step.
 
 ## Output
 

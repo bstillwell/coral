@@ -10,14 +10,15 @@ Coral (Clyso Optimized RebALancer) is a Ceph cluster rebalancing tool. It analyz
 
 ```bash
 # Default (dry-run) — connects to Ceph, computes upmap changes, prints the
-# pg-upmap-items commands instead of applying them. Safe to run.
+# first round of pg-upmap-items commands instead of applying them. Safe to run.
 ./coral.py
 
 # Preview — show current/future OSD usage without modifying anything and
 # without writing to the log file
 ./coral.py --preview
 
-# Apply — actually push the upmap changes to the cluster
+# Apply — step every PG toward its target one shard at a time, a round every
+# --interval seconds (default 60), until done
 ./coral.py --apply
 ```
 
@@ -48,7 +49,9 @@ get_backfillfull_ratio() → backfillfull_ratio float
 
 `get_cluster_state()` finishes by calling `calculate_pg_distribution()`, which fills in `osds[osd_id]['target_pgs_by_pool'][pool_id] = (floor, ceil)` — the per-OSD min/max PG count for a balanced cluster, derived from the OSD's CRUSH-weight share among the pool rule's `valid_osds`, scaled by `pg_num * pool_size` (replica count or k+m). OSDs whose `crush_weight < 0.0001` are treated as zero so they don't pull a share away from the rest.
 
-`calculate_usage()` populates `current_usage`/`future_usage` and per-pool PG counts (`current_pgs_by_pool` / `future_pgs_by_pool`) per OSD. `rebuild_upmaps()` then simulates removing every upmap: undoing each PG's `pg_upmap_items` last-first (the reverse of how Ceph applies them — an item applies only if `from` is in the set, `to` isn't, and `to` isn't out) recovers the placement CRUSH computes with no upmaps. It then re-adds an existing item only if it's *helpful* — moves a PG from an OSD over its target toward one under it (same test as below) — and wouldn't leave an OSD with upmaps moving data both onto and off it in the same pool (`would_mix_roles()`, backed by per-(pool, OSD) counts in `cluster_state['upmap_roles']`). Dropped items send their PGs back to CRUSH's placement. After that, `balance_off_target_osds()` walks each pool and queues new upmaps — via `queue_upmap_mapping_addition()` — that move PGs from donor OSDs (count > floor) to recipients (count < ceil), committing a move only if the donor is over its ceil or the recipient is under its floor, while respecting the pool's CRUSH rule (`valid_osds`), failure-domain uniqueness (looked up via `osd_bucket_maps[failure_domain]`) and `would_mix_roles()`. It tries moves back onto an OSD that already holds the PG's shard (`pg['original_up']`) first, since those cost no data movement. When no such move exists, `drain_to_at_ceil_osd()` lets an OSD with a target of `(0, 0)` (out, or CRUSH weight ~0) hand a PG to an OSD already at its ceil; that OSD is then over-ceil and passes a different PG on during the next pass. This drain path is the one exception to `would_mix_roles()` (the relay OSD is tracked in `cluster_state['drain_relays']`). Finally `apply_upmap_queue()` sends `osd pg-upmap-items` / `osd rm-pg-upmap-items` commands for PGs whose items changed (it skips any whose final items match `pg['original_upmaps']`).
+`calculate_usage()` populates `current_usage`/`future_usage` and per-pool PG counts (`current_pgs_by_pool` / `future_pgs_by_pool`) per OSD. `rebuild_upmaps()` then simulates removing every upmap: undoing each PG's `pg_upmap_items` last-first (the reverse of how Ceph applies them — an item applies only if `from` is in the set, `to` isn't, and `to` isn't out) recovers the placement CRUSH computes with no upmaps. It then re-adds an existing item only if it's *helpful* — moves a PG from an OSD over its target toward one under it (same test as below) — and wouldn't leave an OSD with upmaps moving data both onto and off it in the same pool (`would_mix_roles()`, backed by per-(pool, OSD) counts in `cluster_state['upmap_roles']`). Dropped items send their PGs back to CRUSH's placement. After that, `balance_off_target_osds()` walks each pool and queues new upmaps — via `queue_upmap_mapping_addition()` — that move PGs from donor OSDs (count > floor) to recipients (count < ceil), committing a move only if the donor is over its ceil or the recipient is under its floor, while respecting the pool's CRUSH rule (`valid_osds`), failure-domain uniqueness (looked up via `osd_bucket_maps[failure_domain]`) and `would_mix_roles()`. It tries moves back onto an OSD that already holds the PG's shard (`pg['original_up']`) first, since those cost no data movement. When no such move exists, `drain_to_at_ceil_osd()` lets an OSD with a target of `(0, 0)` (out, or CRUSH weight ~0) hand a PG to an OSD already at its ceil; that OSD is then over-ceil and passes a different PG on during the next pass. This drain path is the one exception to `would_mix_roles()` (the relay OSD is tracked in `cluster_state['drain_relays']`). `plan_upmaps()` wraps those two steps and returns the plan — `{pgid: target up set}` from `build_upmap_plan()` for PGs whose items changed — plus a `plan_fingerprint()` of the OSD map (CRUSH version, OSD up/in/reweight, pool pg_num/size/rule; everything but upmaps).
+
+Changes are applied one shard per PG at a time, because all of a PG's backfill flows through its primary and the PG holds backfill reservations on the primary and every target until the whole PG finishes. `run_upmap_plan()` loops every `--interval` seconds: it re-fetches `osd dump` (returning `'replan'` if the fingerprint changed) and `pg dump`, then `apply_upmap_round()` gives every PG that isn't at its target and is settled (`is_pg_settled()`: active+clean, not remapped, up == acting) the items for its next single-shard step. `next_upmap_step()` recovers CRUSH's raw set with `unapply_upmap_items()`, changes one position of the up set, and `items_for_up()` builds the minimal `pg_upmap_items` for it, ordered so each item applies (checked with `apply_upmap_items()`, a port of `OSDMap::_apply_upmap`). A PG with no single-shard step (an EC position swap) gets its whole move in one change. `send_upmap_items()` sends the command and checks `mon_command`'s return code.
 
 ## RADOS Communication
 
@@ -59,7 +62,7 @@ cmd = {'prefix': 'osd dump', 'format': 'json'}
 ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
 ```
 
-Dry-run mode intercepts `apply_upmap_queue()` and prints the equivalent `ceph` CLI commands instead.
+Dry-run mode (`print_upmap_plan()`) runs one `apply_upmap_round()` against the starting state with `is_dryrun=True`, which prints the equivalent `ceph` CLI commands instead of sending them, followed by a summary of the remaining PGs and shard moves.
 
 ## Usage Calculation
 

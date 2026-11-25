@@ -6,6 +6,7 @@ import logging
 import math
 import rados
 import sys
+import time
 from collections import defaultdict
 
 BLUE = '\033[0;34m'
@@ -23,7 +24,9 @@ def main():
     parser.add_argument('--preview', action='store_true',
                         help="Show the current and future cluster state based on existing PG up/acting sets only — no rebalancing computation, no cluster or log writes")
     parser.add_argument('--apply', action='store_true',
-                        help="Apply the upmap changes to the cluster. Without this flag, coral runs in dry-run mode and prints the pg-upmap-items commands instead.")
+                        help="Apply the upmap changes to the cluster, one shard per PG at a time: every --interval seconds, each PG that is active+clean and not yet at its target gets its next single-shard change. Runs until every PG is at its target. Without this flag, coral runs in dry-run mode and prints the first round of pg-upmap-items commands instead.")
+    parser.add_argument('--interval', type=float, default=60,
+                        help="Seconds between rounds when applying (default: 60)")
     parser.add_argument('--preview-pgs', action='store_true',
                         help="After the usage table, print a per-OSD breakdown of future PGs by pool with their target floor/ceil")
     args = parser.parse_args()
@@ -49,20 +52,28 @@ def main():
     # displayed current/future state reflects only what the cluster will do on
     # its own from existing PG up/acting sets.
     if not is_preview:
-        # Simulate removing every upmap, then keep only the existing ones that help
-        rebuild_upmaps(cluster_state, logger)
-
-        # Add new upmap mappings to pull off-target OSDs into their per-pool range
-        balance_off_target_osds(cluster_state, logger)
-
-        # Apply the changes we determined were needed
-        apply_upmap_queue(cluster, cluster_state, is_dryrun, logger)
+        # Work out the target placement for every PG
+        plan, fingerprint = plan_upmaps(cluster, cluster_state, logger)
 
     # Provide a nice display of current and future OSD usage
     display_usage(cluster_state)
 
     if args.preview_pgs:
         display_pgs_by_pool(cluster_state)
+
+    if not is_preview:
+        if is_dryrun:
+            print_upmap_plan(cluster_state, plan, args.interval, logger)
+        else:
+            try:
+                # Step every PG toward its target one shard at a time,
+                # re-planning if the cluster changes underneath us
+                while run_upmap_plan(cluster, plan, fingerprint, args.interval, logger) == 'replan':
+                    cluster_state = get_cluster_state(cluster, logger)
+                    calculate_usage(cluster_state, logger)
+                    plan, fingerprint = plan_upmaps(cluster, cluster_state, logger)
+            except KeyboardInterrupt:
+                logger.info("Interrupted; stopping between rounds. Re-run to continue.")
 
     # Disconnect from the cluster
     logger.debug("Disconnecting from Ceph cluster")
@@ -702,10 +713,21 @@ def balance_off_target_osds(cluster_state, logger):
         # Set by rebuild_upmaps(): where each PG's shards are before this run
         prefer_free = any('original_up' in pg for _, pg in pool_pgs)
 
+        is_replica = pool['type'] == 'replica'
+
+        def costs_nothing(pg, from_osd, to_osd):
+            """True if to_osd already holds the data from_osd would hand it.
+            Replicas are interchangeable; an EC shard is only already there if
+            to_osd held that same shard position before this run."""
+            original_up = pg.get('original_up', ())
+            if is_replica:
+                return to_osd in original_up
+            pos = pg['up'].index(from_osd)
+            return pos < len(original_up) and original_up[pos] == to_osd
+
         def candidate_moves(from_osd, destinations):
             """(pgid, pg, to_osd) moves off from_osd. When the PGs' starting up
-            sets are known, moves back onto an OSD that already holds the PG's
-            shard come first — they cost no data movement."""
+            sets are known, moves that cost no data movement come first."""
             for free_only in ((True, False) if prefer_free else (False,)):
                 for pgid, pg in pool_pgs:
                     if from_osd not in pg['up']:
@@ -713,7 +735,7 @@ def balance_off_target_osds(cluster_state, logger):
                     for to_osd in destinations:
                         if to_osd in pg['up']:
                             continue
-                        if free_only and to_osd not in pg.get('original_up', ()):
+                        if free_only and not costs_nothing(pg, from_osd, to_osd):
                             continue
                         yield pgid, pg, to_osd
 
@@ -844,34 +866,213 @@ def drain_to_at_ceil_osd(cluster_state, pool_id, valid_osds, bucket_map, logger)
 
     return False
 
-def apply_upmap_queue(cluster, cluster_state, is_dryrun, logger):
-    logger.debug("Applying upmap changes")
+def apply_upmap_items(raw, items, is_in):
+    """The up set Ceph computes from CRUSH's raw set and a PG's pg_upmap_items.
 
-    upmap_queue = cluster_state['upmap_queue']
-    pgs = cluster_state.get('pgs', {})
-    for pgid in upmap_queue:
-        mappings = upmap_queue[pgid]
-        # rebuild_upmaps() touches every upmapped PG; skip the ones that ended
-        # up with exactly the items the cluster already has. Order doesn't
-        # matter: kept items never chain (that would mix roles on an OSD).
-        original = pgs.get(pgid, {}).get('original_upmaps')
-        if original is not None and sorted(mappings) == sorted(original):
+    Mirrors OSDMap::_apply_upmap: items apply in order, and (from, to) replaces
+    from only if from is in the set, to isn't, and to isn't marked out.
+    """
+    up = list(raw)
+    for from_osd, to_osd in items:
+        if to_osd in up:
             continue
-        if len(mappings) == 0:
-            if is_dryrun:
-                print(f"ceph osd rm-pg-upmap-items {pgid}")
-            else:
-                logger.info(f"Removing upmap items for {pgid}")
-                cmd = {'prefix': 'osd rm-pg-upmap-items', 'pgid': pgid, 'format': 'json'}
-                ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
+        if to_osd != CRUSH_ITEM_NONE and not is_in(to_osd):
+            continue
+        if from_osd in up:
+            up[up.index(from_osd)] = to_osd
+    return up
+
+def unapply_upmap_items(up, items, is_in):
+    """CRUSH's raw set for a PG: undo its items last-first, skipping ones Ceph didn't apply."""
+    raw = list(up)
+    for from_osd, to_osd in reversed(items):
+        if to_osd in raw and from_osd not in raw and is_in(to_osd):
+            raw[raw.index(to_osd)] = from_osd
+    return raw
+
+def items_for_up(raw, up, is_in):
+    """Minimal pg_upmap_items that turn CRUSH's raw set into up, or None.
+
+    One (raw[i], up[i]) item per position that differs. An item only applies
+    if its target isn't in the set yet, so an item whose target is another
+    position's raw OSD has to come after the item moving that OSD out. A swap
+    can't be expressed at all (Ceph doesn't allow bidirectional items).
+    """
+    if len(raw) != len(up) or CRUSH_ITEM_NONE in raw:
+        return None
+    pending = {i: (raw[i], up[i]) for i in range(len(raw)) if raw[i] != up[i]}
+    current = list(raw)
+    items = []
+    while pending:
+        ready = [i for i, (_, to_osd) in pending.items() if to_osd not in current]
+        if not ready:
+            return None
+        i = min(ready)
+        from_osd, to_osd = pending.pop(i)
+        items.append((from_osd, to_osd))
+        current[i] = to_osd
+    if apply_upmap_items(raw, items, is_in) != list(up):
+        return None
+    return items
+
+def next_upmap_step(raw, current_up, target_up, is_in):
+    """pg_upmap_items that move exactly one shard of the PG toward target_up, or None.
+
+    Picks the first position that differs and whose target OSD isn't already
+    elsewhere in the PG (that position has to change first).
+    """
+    if not (len(raw) == len(current_up) == len(target_up)):
+        return None
+    for i, (cur, tgt) in enumerate(zip(current_up, target_up)):
+        if cur == tgt or tgt in current_up:
+            continue
+        step_up = list(current_up)
+        step_up[i] = tgt
+        items = items_for_up(raw, step_up, is_in)
+        if items is not None:
+            return items
+    return None
+
+def is_pg_settled(pg):
+    """active+clean, nothing left to backfill: safe to start the PG's next change."""
+    state = set(pg['state'])
+    return {'active', 'clean'} <= state and 'remapped' not in state and pg['up'] == pg['acting']
+
+def get_osd_dump(cluster):
+    cmd = {'prefix': 'osd dump', 'format': 'json'}
+    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
+    return json.loads(output.decode('utf-8'))
+
+def plan_fingerprint(osd_dump):
+    """Everything the plan depends on except upmaps, which coral itself changes."""
+    return (
+        osd_dump.get('crush_version'),
+        tuple(sorted((o['osd'], o['up'], o['in'], o['weight']) for o in osd_dump['osds'])),
+        tuple(sorted((p['pool'], p['pg_num'], p['size'], p['crush_rule']) for p in osd_dump['pools'])),
+    )
+
+def build_upmap_plan(cluster_state):
+    """{pgid: target up set} for every PG whose upmap items the rebuild and balancing changed."""
+    plan = {}
+    for pgid, pg in cluster_state['pgs'].items():
+        original_items = pg.get('original_upmaps', pg['upmaps'])
+        original_up = pg.get('original_up', pg['up'])
+        if pg['up'] != original_up or sorted(pg['upmaps']) != sorted(original_items):
+            plan[pgid] = list(pg['up'])
+    return plan
+
+def plan_upmaps(cluster, cluster_state, logger):
+    """Compute target placements. Returns (plan, fingerprint of the cluster it was made for)."""
+    fingerprint = plan_fingerprint(get_osd_dump(cluster))
+
+    # Simulate removing every upmap, then keep only the existing ones that help
+    rebuild_upmaps(cluster_state, logger)
+
+    # Add new upmap mappings to pull off-target OSDs into their per-pool range
+    balance_off_target_osds(cluster_state, logger)
+
+    return build_upmap_plan(cluster_state), fingerprint
+
+def send_upmap_items(cluster, pgid, items, is_dryrun, logger):
+    """Set a PG's pg_upmap_items (or remove them all). Returns False if the mon refused."""
+    if items:
+        ids = [osd for pair in items for osd in pair]
+        cmd = {'prefix': 'osd pg-upmap-items', 'pgid': pgid, 'id': ids, 'format': 'json'}
+        text = f"ceph osd pg-upmap-items {pgid} {' '.join(str(i) for i in ids)}"
+    else:
+        cmd = {'prefix': 'osd rm-pg-upmap-items', 'pgid': pgid, 'format': 'json'}
+        text = f"ceph osd rm-pg-upmap-items {pgid}"
+    if is_dryrun:
+        print(text)
+        return True
+    logger.info(f"Setting upmap items for {pgid}: {items}")
+    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
+    if ret != 0:
+        logger.error(f"'{text}' failed ({ret}): {errs}")
+        return False
+    return True
+
+def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger):
+    """Start the next single-shard change on every settled PG not yet at its target.
+
+    All of a PG's backfill flows through its primary, and the PG holds a backfill
+    reservation on the primary and every target OSD until the whole PG is done.
+    Moving one shard per PG at a time spreads that load across many primaries
+    and frees each reservation as soon as its shard lands.
+
+    Returns (changes started, PGs not yet at their target).
+    """
+    started = remaining = 0
+    for pgid, target_up in plan.items():
+        pg = pgs.get(pgid)
+        if pg is None:
+            logger.warning(f"PG {pgid} no longer exists; skipping")
+            continue
+        raw = unapply_upmap_items(pg['up'], pg['upmaps'], is_in)
+        final_items = items_for_up(raw, target_up, is_in)
+        if pg['up'] == target_up and final_items is not None and sorted(pg['upmaps']) == sorted(final_items):
+            continue
+        remaining += 1
+        if not is_pg_settled(pg):
+            continue
+        if pg['up'] == target_up:
+            # Placement is right; just drop items that no longer do anything
+            items = final_items
         else:
-            mappings_list = [item for pair in mappings for item in pair]
-            if is_dryrun:
-                print(f"ceph osd pg-upmap-items {pgid} {' '.join(str(i) for i in mappings_list)}")
-            else:
-                logger.info(f"Applying upmap items for {pgid}: {mappings}")
-                cmd = {'prefix': 'osd pg-upmap-items', 'pgid': pgid, 'id': mappings_list, 'format': 'json'}
-                ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
+            items = next_upmap_step(raw, pg['up'], target_up, is_in)
+            if items is None:
+                # Can't get there one shard at a time; make the whole move at once
+                logger.warning(f"No single-shard step for {pgid} from {pg['up']} to {target_up}; moving it in one change")
+                items = final_items
+        if items is None:
+            logger.warning(f"Can't express {pgid} target {target_up} as upmap items from CRUSH set {raw}; skipping")
+            continue
+        if send_upmap_items(cluster, pgid, items, is_dryrun, logger):
+            started += 1
+    return started, remaining
+
+def run_upmap_plan(cluster, plan, fingerprint, interval, logger, sleep=time.sleep):
+    """Apply a plan one shard per PG per round, every interval seconds.
+
+    Returns 'done' once every PG is at its target, or 'replan' if OSDs, weights,
+    pools or the CRUSH map changed since the plan was made.
+    """
+    round_no = 0
+    while True:
+        round_no += 1
+        osd_dump = get_osd_dump(cluster)
+        if plan_fingerprint(osd_dump) != fingerprint:
+            logger.warning("OSDs, weights, pools or the CRUSH map changed since planning; re-planning")
+            return 'replan'
+        in_osds = {o['osd'] for o in osd_dump['osds'] if o['in']}
+        pgs = get_pg_info(cluster, logger)
+        started, remaining = apply_upmap_round(cluster, plan, pgs, in_osds.__contains__, False, logger)
+        logger.info(f"Round {round_no}: started {started} single-shard change(s); "
+                    f"{remaining} PG(s) not yet at their target")
+        if remaining == 0:
+            logger.info("Every PG is at its target placement")
+            return 'done'
+        sleep(interval)
+
+def print_upmap_plan(cluster_state, plan, interval, logger):
+    """Dry run: print the first round of commands and summarize the rest."""
+    osds = cluster_state['osds']
+    def is_in(osd_id):
+        return osds.get(osd_id, {}).get('in', 0) != 0
+    pgs = {
+        pgid: {**pg, 'up': pg.get('original_up', pg['up']), 'upmaps': pg.get('original_upmaps', pg['upmaps'])}
+        for pgid, pg in cluster_state['pgs'].items()
+    }
+    started, remaining = apply_upmap_round(None, plan, pgs, is_in, True, logger)
+    shard_moves = sum(
+        sum(1 for a, b in zip(pgs[pgid]['up'], target_up) if a != b)
+        for pgid, target_up in plan.items()
+    )
+    print(f"# {remaining} PG(s) to change ({shard_moves} shard move(s) in total); "
+          f"the {started} command(s) above are the first round.")
+    if remaining:
+        print(f"# With --apply, coral starts each PG's next single-shard change once it's "
+              f"active+clean again, checking every {interval:g}s.")
 
 def display_usage(cluster_state):
     osds = cluster_state['osds']
