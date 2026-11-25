@@ -379,6 +379,21 @@ class TestQueueUpmapMappingRemoval:
         coral.queue_upmap_mapping_removal(base_cluster_state, "1.0", (0, 1), logger)
         assert "1.0" in base_cluster_state["upmap_queue"]
 
+    def test_restores_from_osd_in_up_set(self, base_cluster_state, logger):
+        coral.queue_upmap_mapping_removal(base_cluster_state, "1.0", (0, 1), logger)
+        assert base_cluster_state["pgs"]["1.0"]["up"] == [0]
+
+    def test_restores_from_osd_in_same_up_slot(self, logger):
+        # EC shard position matters: from_osd must return to to_osd's slot.
+        state = {
+            "osds": {i: {"future_usage": 0, "future_pgs": 1, "future_pgs_by_pool": {1: 1}} for i in range(4)},
+            "pgs": {"1.0": {"up": [2, 3, 1], "acting": [2, 3, 1], "num_bytes": 0, "upmaps": [(0, 3)]}},
+            "pools": {1: {"type": "replica"}},
+            "upmap_queue": {},
+        }
+        coral.queue_upmap_mapping_removal(state, "1.0", (0, 3), logger)
+        assert state["pgs"]["1.0"]["up"] == [2, 0, 1]
+
     def test_ec_pool_shifts_per_shard_bytes_not_full_pg(self, logger):
         # EC pool with k=4: each OSD's shard is num_bytes / 4, not num_bytes.
         state = {
@@ -421,6 +436,40 @@ class TestRemoveUnderTargetMappings:
         base_cluster_state["osds"][0]["target_pgs_by_pool"] = {}
         coral.remove_under_target_mappings(base_cluster_state, logger)
         assert "1.0" not in base_cluster_state["upmap_queue"]
+
+    def test_balance_after_removal_sees_restored_up_set(self, logger):
+        # PG 1.0's CRUSH set is [0, 2], redirected to [1, 2] by upmap (0 -> 1).
+        # osd.0 is under its floor, so the upmap is removed. The balancer must
+        # then plan against up=[0, 2]; with a stale up=[1, 2] it would queue a
+        # bogus (2 -> 0) that Ceph ignores because osd.0 is already in the PG.
+        osds = {i: {"in": 1, "crush_weight": 1.0} for i in range(3)}
+        pgs = {
+            "1.0": {"up": [1, 2], "acting": [1, 2], "num_bytes": 1, "upmaps": [(0, 1)]},
+            "1.1": {"up": [1, 2], "acting": [1, 2], "num_bytes": 1, "upmaps": []},
+            "1.2": {"up": [1, 2], "acting": [1, 2], "num_bytes": 1, "upmaps": []},
+        }
+        state = {
+            "osds": osds,
+            "pgs": pgs,
+            "pools": {1: {"type": "replica", "crush_rule": 0, "pgs": 3, "size": 2}},
+            "crush_rules": {0: {"steps": [{"op": "chooseleaf_firstn", "type": "host"}], "valid_osds": [0, 1, 2]}},
+            "osd_bucket_maps": {"host": {0: "h0", 1: "h1", 2: "h2"}},
+            "upmap_queue": {},
+        }
+        coral.calculate_pg_distribution(state, logger)
+        coral.calculate_usage(state, logger)
+        coral.remove_under_target_mappings(state, logger)
+        coral.balance_off_target_osds(state, logger)
+
+        for pgid, pg in pgs.items():
+            assert len(set(pg["up"])) == len(pg["up"]), pgid
+            for from_osd, to_osd in pg["upmaps"]:
+                assert from_osd != to_osd
+        # Every OSD lands at its target of 2 PGs, and the model matches the
+        # up sets the balancer left behind.
+        for osd_id in osds:
+            actual = sum(osd_id in pg["up"] for pg in pgs.values())
+            assert osds[osd_id]["future_pgs_by_pool"][1] == actual == 2
 
     def test_recalculates_counts_after_removal(self, base_cluster_state, logger):
         base_cluster_state["osds"][0]["target_pgs_by_pool"][1] = (1, 2)

@@ -444,6 +444,16 @@ def queue_upmap_mapping_removal(cluster_state, pgid, mapping, logger):
     per_osd_bytes = num_bytes if pool['type'] == 'replica' else num_bytes / pool['k']
 
     cluster_state['pgs'][pgid]['upmaps'].remove(mapping)
+
+    # Reflect the restored placement in the up set so later passes (e.g.
+    # balance_off_target_osds) see the PG back on from_osd, not on to_osd.
+    # The redirect replaced from_osd in place, so restore it in the same slot.
+    up = cluster_state['pgs'][pgid]['up']
+    for i, osd in enumerate(up):
+        if osd == to_osd:
+            up[i] = from_osd
+            break
+
     cluster_state['osds'][from_osd]['future_usage'] += per_osd_bytes
     cluster_state['osds'][from_osd]['future_pgs'] += 1
     cluster_state['osds'][from_osd]['future_pgs_by_pool'][pool_id] = \
