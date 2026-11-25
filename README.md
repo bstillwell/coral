@@ -31,6 +31,8 @@ Coral (Clyso Optimized RebALancer) is a Ceph cluster rebalancing tool. It analyz
 5. **Display results** — a color-coded table shows each OSD's size, current usage, future usage, and the delta.
 6. **Apply changes** — one shard per PG at a time. All of a PG's backfill flows through its primary OSD, and the PG holds a backfill reservation on the primary and every target OSD until the whole PG is done, so moving every shard of a wide EC PG at once is slow and blocks other PGs on those OSDs. Instead, each round sends every settled PG the upmap items for its next single-shard step.
 
+Full OSDs come first. Each PG's next step moves the shard off its fullest OSD, and while any PG with a planned move off a nearfull OSD (at or above the cluster's `nearfull_ratio`) can step or is backfilling, only those PGs start — the rest wait. Planning never adds a move that would take an OSD past `backfillfull_ratio` (Ceph would hold it as `backfill_toofull`), and keeps an existing upmap if dropping it would send data back onto an OSD past that ratio.
+
 ## Output
 
 ```

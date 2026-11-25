@@ -125,6 +125,7 @@ def get_cluster_state(cluster, logger):
     cluster_state['crush_rules'] = get_crush_rules(cluster, logger)
     cluster_state['osd_bucket_maps'] = get_osd_bucket_maps(cluster, logger)
     cluster_state['backfillfull_ratio'] = get_backfillfull_ratio(cluster, logger)
+    cluster_state['nearfull_ratio'] = get_nearfull_ratio(cluster, logger)
     cluster_state['upmap_queue'] = {}
 
     calculate_pg_distribution(cluster_state, logger)
@@ -156,19 +157,22 @@ def get_osd_info(cluster, logger, pg_dump=None):
     ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
     crush_tree = json.loads(output.decode('utf-8'))
 
-    # Get each OSD's size from the per-OSD stats in 'pg dump'. An OSD that
-    # hasn't reported stats (e.g. down since the mgr started) has no entry;
-    # treat it as size 0.
+    # Get each OSD's size and raw usage from the per-OSD stats in 'pg dump'.
+    # An OSD that hasn't reported stats (e.g. down since the mgr started) has
+    # no entry; treat it as size 0.
     if pg_dump is None:
         pg_dump = get_pg_dump(cluster)
-    osd_kb = {s['osd']: s['kb'] for s in pg_dump['pg_map'].get('osd_stats', [])}
+    osd_stats = {s['osd']: s for s in pg_dump['pg_map'].get('osd_stats', [])}
 
     for node in crush_tree.get('nodes', []):
         if node.get('type') != 'osd':
             continue
         osd_id = node['id']
+        stats = osd_stats.get(osd_id, {})
         osd_info[osd_id]['crush_weight'] = node['crush_weight']
-        osd_info[osd_id]['size'] = osd_kb.get(osd_id, 0) * 1024
+        osd_info[osd_id]['size'] = stats.get('kb', 0) * 1024
+        if 'kb_used' in stats:
+            osd_info[osd_id]['used'] = stats['kb_used'] * 1024
         osd_info[osd_id]['device_class'] = node.get('device_class', '')
 
     return osd_info
@@ -300,6 +304,55 @@ def get_backfillfull_ratio(cluster, logger):
     logger.debug(f"Cluster backfillfull_ratio is {backfillfull_ratio}")
 
     return backfillfull_ratio
+
+def get_nearfull_ratio(cluster, logger):
+    logger.debug("Fetching nearfull_ratio")
+
+    # OSDs at or above this ratio get their data moved off first
+    nearfull_ratio = get_osd_dump(cluster).get('nearfull_ratio')
+    if nearfull_ratio is None:
+        logger.warning("nearfull_ratio not found in the 'osd dump'. Defaulting to 0.85")
+        nearfull_ratio = 0.85
+    logger.debug(f"Cluster nearfull_ratio is {nearfull_ratio}")
+
+    return nearfull_ratio
+
+def osd_utilization(pg_dump):
+    """{osd: used fraction} from the per-OSD stats in 'pg dump'."""
+    return {s['osd']: s.get('kb_used', 0) / s['kb']
+            for s in pg_dump['pg_map'].get('osd_stats', []) if s.get('kb')}
+
+def shard_bytes(cluster_state, pgid):
+    """Bytes one OSD holds for pgid: the whole PG for replicas, num_bytes / k for an EC shard."""
+    pool = cluster_state['pools'][int(pgid.split('.')[0])]
+    num_bytes = cluster_state['pgs'][pgid]['num_bytes']
+    return num_bytes if pool['type'] == 'replica' else num_bytes / pool['k']
+
+def fits_below_backfillfull(cluster_state, osd_id, pgid):
+    """True if one more shard of pgid keeps osd_id's projected usage within
+    backfillfull_ratio. Ceph refuses backfill onto an OSD past that ratio
+    (backfill_toofull), so planning such a move would just stall."""
+    ratio = cluster_state.get('backfillfull_ratio')
+    if ratio is None:
+        return True
+    size = cluster_state['osds'][osd_id].get('size', 0)
+    if not size:
+        return False
+    return projected_usage(cluster_state, osd_id) + shard_bytes(cluster_state, pgid) <= size * ratio
+
+def projected_usage(cluster_state, osd_id):
+    """Bytes osd_id will hold once the plan's backfill completes."""
+    osd = cluster_state['osds'][osd_id]
+    if 'used' in osd:
+        # Raw usage today (includes BlueStore overhead, omap, ...) plus the
+        # net data the plan moves onto the OSD
+        return osd['used'] + osd['future_usage'] - osd['current_usage']
+    return osd['future_usage']
+
+def is_past_backfillfull(cluster_state, osd_id):
+    ratio = cluster_state.get('backfillfull_ratio')
+    size = cluster_state['osds'][osd_id].get('size', 0)
+    return ratio is not None and size > 0 and projected_usage(cluster_state, osd_id) > size * ratio
 
 def get_rule_failure_domain(rule):
     """Return the bucket type that is the failure domain for a CRUSH rule
@@ -637,6 +690,8 @@ def rebuild_upmaps(cluster_state, logger):
         peer_buckets = {bucket_map.get(o) for o in up if o != from_osd and o != CRUSH_ITEM_NONE}
         if bucket_map.get(to_osd) in peer_buckets:
             return False
+        if not fits_below_backfillfull(cluster_state, to_osd, pgid):
+            return False
         return not would_mix_roles(cluster_state, pgid, (from_osd, to_osd))
 
     def benefit(candidate):
@@ -662,9 +717,38 @@ def rebuild_upmaps(cluster_state, logger):
             break
         candidates = remaining
 
-    logger.info(f"Kept {total - len(candidates)} of {total} existing upmap items")
+    # Dropping an item sends its PG back to the OSD CRUSH picked. If that
+    # leaves an OSD past backfillfull_ratio, restore dropped items that moved
+    # data off it — largest PGs first — until it fits again, whether or not
+    # they're "helpful" by PG count.
+    restored = 0
+    for pgid, (from_osd, to_osd) in sorted(candidates, key=lambda c: -shard_bytes(cluster_state, c[0])):
+        if not is_past_backfillfull(cluster_state, from_osd):
+            continue
+        pool_id = int(pgid.split('.')[0])
+        valid_osds, bucket_map = rules[pool_id]
+        up = pgs[pgid]['up']
+        if to_osd not in valid_osds or from_osd not in up or to_osd in up:
+            continue
+        peer_buckets = {bucket_map.get(o) for o in up if o != from_osd and o != CRUSH_ITEM_NONE}
+        if bucket_map.get(to_osd) in peer_buckets:
+            continue
+        if not fits_below_backfillfull(cluster_state, to_osd, pgid):
+            continue
+        if would_mix_roles(cluster_state, pgid, (from_osd, to_osd)):
+            continue
+        logger.debug(f"Keeping existing upmap {pgid}: ({from_osd} -> {to_osd}) so osd.{from_osd} stays under backfillfull")
+        queue_upmap_mapping_addition(cluster_state, pgid, (from_osd, to_osd), logger)
+        candidates.remove((pgid, (from_osd, to_osd)))
+        restored += 1
+
+    logger.info(f"Kept {total - len(candidates)} of {total} existing upmap items"
+                + (f" ({restored} to keep OSDs under backfillfull)" if restored else ""))
     for pgid, (from_osd, to_osd) in candidates:
         logger.debug(f"Dropping existing upmap {pgid}: ({from_osd} -> {to_osd})")
+    for osd_id in cluster_state['osds']:
+        if is_past_backfillfull(cluster_state, osd_id):
+            logger.warning(f"osd.{osd_id} is still projected past backfillfull_ratio after rebuilding upmaps")
 
 def queue_upmap_mapping_addition(cluster_state, pgid, mapping, logger):
     logger.debug(f"Queueing upmap mapping addition for {pgid}: Adding {mapping} to {cluster_state['pgs'][pgid]['upmaps']}")
@@ -787,6 +871,8 @@ def balance_off_target_osds(cluster_state, logger):
                     }
                     if to_bucket in peer_buckets:
                         continue
+                    if not fits_below_backfillfull(cluster_state, to_osd, pgid):
+                        continue
                     # An OSD that drain_to_at_ceil_osd() relayed a PG through
                     # may pass a PG on while over its ceil, even though it
                     # now has upmaps both onto and off it — that second hop
@@ -856,6 +942,8 @@ def drain_to_at_ceil_osd(cluster_state, pool_id, valid_osds, bucket_map, logger)
                     continue
                 if bucket_map.get(to_osd) in peer_buckets:
                     continue
+                if not fits_below_backfillfull(cluster_state, to_osd, pgid):
+                    continue
                 logger.info(
                     f"Adding draining upmap {pgid}: ({from_osd} -> {to_osd}) "
                     f"[pool={pool_id}, to_count={count(to_osd)}/ceil={target(to_osd)[1]}]"
@@ -915,15 +1003,20 @@ def items_for_up(raw, up, is_in):
         return None
     return items
 
-def next_upmap_step(raw, current_up, target_up, is_in):
+def next_upmap_step(raw, current_up, target_up, is_in, utilization=None):
     """pg_upmap_items that move exactly one shard of the PG toward target_up, or None.
 
-    Picks the first position that differs and whose target OSD isn't already
-    elsewhere in the PG (that position has to change first).
+    Moves the shard off the fullest OSD first (per utilization, {osd: used
+    fraction}), skipping positions whose target OSD is still elsewhere in the
+    PG — that other position has to change first.
     """
     if not (len(raw) == len(current_up) == len(target_up)):
         return None
-    for i, (cur, tgt) in enumerate(zip(current_up, target_up)):
+    utilization = utilization or {}
+    positions = sorted(range(len(current_up)),
+                       key=lambda i: (-utilization.get(current_up[i], 0), i))
+    for i in positions:
+        cur, tgt = current_up[i], target_up[i]
         if cur == tgt or tgt in current_up:
             continue
         step_up = list(current_up)
@@ -948,17 +1041,43 @@ def plan_fingerprint(osd_dump):
     return (
         osd_dump.get('crush_version'),
         tuple(sorted((o['osd'], o['up'], o['in'], o['weight']) for o in osd_dump['osds'])),
-        tuple(sorted((p['pool'], p['pg_num'], p['size'], p['crush_rule']) for p in osd_dump['pools'])),
+        # pg_placement_num is pgp_num: during a PG split it changes on its own
+        # schedule and moves child PGs to new OSDs
+        tuple(sorted((p['pool'], p['pg_num'], p.get('pg_placement_num'), p['size'], p['crush_rule'])
+                     for p in osd_dump['pools'])),
     )
+
+def align_replicas(current_up, target_up):
+    """Reorder a replicated PG's target so OSDs it keeps stay in their current
+    slots and arriving OSDs take the slots of leaving ones.
+
+    Replicas are interchangeable, so only membership costs data movement.
+    Stepping works slot by slot; without this, an OSD that stays in the PG but
+    changes slot would have its copy moved off and then back on.
+    """
+    if len(current_up) != len(target_up):
+        return list(target_up)
+    arriving = [o for o in target_up if o not in current_up]
+    return [o if o in target_up else arriving.pop(0) for o in current_up]
 
 def build_upmap_plan(cluster_state):
     """{pgid: target up set} for every PG whose upmap items the rebuild and balancing changed."""
     plan = {}
+    osds = cluster_state['osds']
+    def is_in(osd_id):
+        return osds.get(osd_id, {}).get('in', 1) != 0
     for pgid, pg in cluster_state['pgs'].items():
         original_items = pg.get('original_upmaps', pg['upmaps'])
         original_up = pg.get('original_up', pg['up'])
-        if pg['up'] != original_up or sorted(pg['upmaps']) != sorted(original_items):
-            plan[pgid] = list(pg['up'])
+        if pg['up'] == original_up and sorted(pg['upmaps']) == sorted(original_items):
+            continue
+        target_up = list(pg['up'])
+        if cluster_state['pools'][int(pgid.split('.')[0])]['type'] == 'replica':
+            aligned = align_replicas(original_up, target_up)
+            raw = unapply_upmap_items(original_up, original_items, is_in)
+            if items_for_up(raw, aligned, is_in) is not None:
+                target_up = aligned
+        plan[pgid] = target_up
     return plan
 
 def plan_upmaps(cluster, cluster_state, logger):
@@ -992,7 +1111,7 @@ def send_upmap_items(cluster, pgid, items, is_dryrun, logger):
         return False
     return True
 
-def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger):
+def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger, utilization=None, nearfull_ratio=None):
     """Start the next single-shard change on every settled PG not yet at its target.
 
     All of a PG's backfill flows through its primary, and the PG holds a backfill
@@ -1000,9 +1119,29 @@ def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger):
     Moving one shard per PG at a time spreads that load across many primaries
     and frees each reservation as soon as its shard lands.
 
-    Returns (changes started, PGs not yet at their target).
+    Data comes off full OSDs first. A PG is urgent if its plan moves a shard
+    off an OSD at or above nearfull_ratio. While any urgent PG can step this
+    round or is busy backfilling toward it, only urgent PGs start (fullest
+    first); the rest wait for a later round. An urgent PG that's stuck
+    (toofull, peering, degraded, ...) doesn't hold the others back. Steps
+    that move no data (dropping items that no longer do anything) always go.
+
+    utilization is {osd: used fraction}. Returns (changes started, PGs not yet
+    at their target).
     """
-    started = remaining = 0
+    utilization = utilization or {}
+
+    def is_nearfull(osd_id):
+        return nearfull_ratio is not None and utilization.get(osd_id, 0) >= nearfull_ratio
+
+    def is_progressing(pg):
+        state = set(pg['state'])
+        return (bool(state & {'backfilling', 'backfill_wait', 'recovering', 'recovery_wait'})
+                and not state & {'backfill_toofull', 'recovery_toofull'})
+
+    steps = []          # (pgid, items, urgency: fullest nearfull OSD it's leaving, or 0)
+    remaining = 0
+    urgent_in_progress = False
     for pgid, target_up in plan.items():
         pg = pgs.get(pgid)
         if pg is None:
@@ -1013,13 +1152,17 @@ def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger):
         if pg['up'] == target_up and final_items is not None and sorted(pg['upmaps']) == sorted(final_items):
             continue
         remaining += 1
+        urgency = max((utilization.get(o, 0) for o in pg['up']
+                       if o not in target_up and is_nearfull(o)), default=0)
         if not is_pg_settled(pg):
+            if urgency and is_progressing(pg):
+                urgent_in_progress = True
             continue
         if pg['up'] == target_up:
             # Placement is right; just drop items that no longer do anything
             items = final_items
         else:
-            items = next_upmap_step(raw, pg['up'], target_up, is_in)
+            items = next_upmap_step(raw, pg['up'], target_up, is_in, utilization)
             if items is None:
                 # Can't get there one shard at a time; make the whole move at once
                 logger.warning(f"No single-shard step for {pgid} from {pg['up']} to {target_up}; moving it in one change")
@@ -1027,6 +1170,19 @@ def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger):
         if items is None:
             logger.warning(f"Can't express {pgid} target {target_up} as upmap items from CRUSH set {raw}; skipping")
             continue
+        moves_data = apply_upmap_items(raw, items, is_in) != pg['up']
+        steps.append((pgid, items, urgency, moves_data))
+
+    if urgent_in_progress or any(s[2] for s in steps):
+        go = [s for s in steps if s[2] or not s[3]]
+        if len(go) < len(steps):
+            logger.info(f"Holding back {len(steps) - len(go)} step(s) while PGs move data "
+                        f"off nearfull OSDs")
+        steps = go
+    steps.sort(key=lambda s: s[2], reverse=True)
+
+    started = 0
+    for pgid, items, _, _ in steps:
         if send_upmap_items(cluster, pgid, items, is_dryrun, logger):
             started += 1
     return started, remaining
@@ -1045,8 +1201,12 @@ def run_upmap_plan(cluster, plan, fingerprint, interval, logger, sleep=time.slee
             logger.warning("OSDs, weights, pools or the CRUSH map changed since planning; re-planning")
             return 'replan'
         in_osds = {o['osd'] for o in osd_dump['osds'] if o['in']}
-        pgs = get_pg_info(cluster, logger)
-        started, remaining = apply_upmap_round(cluster, plan, pgs, in_osds.__contains__, False, logger)
+        pg_dump = get_pg_dump(cluster)
+        pgs = get_pg_info(cluster, logger, pg_dump)
+        started, remaining = apply_upmap_round(
+            cluster, plan, pgs, in_osds.__contains__, False, logger,
+            utilization=osd_utilization(pg_dump),
+            nearfull_ratio=osd_dump.get('nearfull_ratio', 0.85))
         logger.info(f"Round {round_no}: started {started} single-shard change(s); "
                     f"{remaining} PG(s) not yet at their target")
         if remaining == 0:
@@ -1059,11 +1219,14 @@ def print_upmap_plan(cluster_state, plan, interval, logger):
     osds = cluster_state['osds']
     def is_in(osd_id):
         return osds.get(osd_id, {}).get('in', 0) != 0
+    utilization = {o: osd['used'] / osd['size'] for o, osd in osds.items() if osd.get('size') and 'used' in osd}
     pgs = {
         pgid: {**pg, 'up': pg.get('original_up', pg['up']), 'upmaps': pg.get('original_upmaps', pg['upmaps'])}
         for pgid, pg in cluster_state['pgs'].items()
     }
-    started, remaining = apply_upmap_round(None, plan, pgs, is_in, True, logger)
+    started, remaining = apply_upmap_round(None, plan, pgs, is_in, True, logger,
+                                           utilization=utilization,
+                                           nearfull_ratio=cluster_state.get('nearfull_ratio'))
     shard_moves = sum(
         sum(1 for a, b in zip(pgs[pgid]['up'], target_up) if a != b)
         for pgid, target_up in plan.items()
@@ -1072,7 +1235,8 @@ def print_upmap_plan(cluster_state, plan, interval, logger):
           f"the {started} command(s) above are the first round.")
     if remaining:
         print(f"# With --apply, coral starts each PG's next single-shard change once it's "
-              f"active+clean again, checking every {interval:g}s.")
+              f"active+clean again, checking every {interval:g}s. While any planned move "
+              f"off a nearfull OSD remains, only those start.")
 
 def display_usage(cluster_state):
     osds = cluster_state['osds']

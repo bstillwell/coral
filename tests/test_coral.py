@@ -954,6 +954,20 @@ class TestUpmapItemHelpers:
         items = coral.next_upmap_step(raw, [0, 1, 2], [1, 4, 2], all_in)
         assert coral.apply_upmap_items(raw, items, all_in) == [0, 4, 2]
 
+    def test_align_replicas_keeps_staying_osds_in_their_slots(self):
+        # OSD 271 stays (moving slots would cost a copy off and back on); 20 -> 951
+        assert coral.align_replicas([20, 271], [271, 951]) == [951, 271]
+        assert coral.align_replicas([1, 2, 3], [3, 4, 1]) == [1, 4, 3]
+
+    def test_replicated_plan_target_is_aligned(self, logger):
+        state = make_state({0: (1, 1), 1: (1, 1), 2: (1, 1)}, {"1.0": ([0, 1], [])})
+        pg = state["pgs"]["1.0"]
+        pg["original_up"], pg["original_upmaps"] = [0, 1], []
+        pg["up"], pg["upmaps"] = [1, 2], [(0, 1), (1, 2)]    # planned: same members as [2, 1]
+        plan = coral.build_upmap_plan(state)
+        assert plan == {"1.0": [2, 1]}
+        assert coral.next_upmap_step([0, 1], [0, 1], plan["1.0"], all_in) == [(0, 2)]
+
     def test_next_step_can_restore_crush_placement(self):
         # Dropping an item is a single-shard step too
         raw = [0, 1]
@@ -990,6 +1004,125 @@ class TestApplyUpmapRound:
         started, remaining = coral.apply_upmap_round(cluster, {"1.0": [3, 1]}, pgs, all_in, False, logger)
         assert (started, remaining) == (1, 1)
         assert json.loads(cluster.mon_command.call_args.args[0])["id"] == [0, 3]
+
+
+class TestFullnessPriority:
+    def test_osd_info_records_raw_usage(self, logger):
+        pg_dump = {"pg_map": {**PG_DUMP["pg_map"],
+                              "osd_stats": [{"osd": 0, "kb": 100, "kb_used": 40}, {"osd": 1, "kb": 100}]}}
+        result = coral.get_osd_info(make_mock_cluster({"pg dump": pg_dump}), logger)
+        assert result[0]["used"] == 40 * 1024
+        assert "used" not in result[1]    # not reported: projections fall back to planned data
+
+    def test_nearfull_ratio_from_osd_dump_or_default(self, logger):
+        assert coral.get_nearfull_ratio(make_mock_cluster({"osd dump": {**OSD_DUMP, "nearfull_ratio": 0.8}}), logger) == 0.8
+        assert coral.get_nearfull_ratio(make_mock_cluster(), logger) == 0.85
+
+    def test_osd_utilization(self):
+        pg_dump = {"pg_map": {"osd_stats": [{"osd": 0, "kb": 200, "kb_used": 50}, {"osd": 1, "kb": 0}]}}
+        assert coral.osd_utilization(pg_dump) == {0: 0.25}
+
+    def test_balance_skips_recipient_that_would_pass_backfillfull(self, balance_cluster_state, logger):
+        # OSD 2 is the only recipient, but another 1 GiB would take it past
+        # 90% of 10 GiB. (OSD 0's target is 0, but the drain fallback can't use
+        # OSD 2 either, and OSD 1 is already in the PG.)
+        balance_cluster_state["osds"][2]["future_usage"] = int(8.5 * GiB)
+        coral.balance_off_target_osds(balance_cluster_state, logger)
+        assert balance_cluster_state["upmap_queue"] == {}
+
+    def test_backfillfull_projection_uses_raw_usage(self, balance_cluster_state):
+        osd = balance_cluster_state["osds"][2]
+        assert coral.fits_below_backfillfull(balance_cluster_state, 2, "1.0")
+        # 8.5 GiB already used on disk (overhead, omap, ...), nothing planned yet
+        osd["used"] = int(8.5 * GiB)
+        assert not coral.fits_below_backfillfull(balance_cluster_state, 2, "1.0")
+
+    def test_rebuild_does_not_keep_upmap_onto_backfillfull_osd(self, logger):
+        # Same as test_keeps_helpful_upmap_and_does_not_resend_it, but OSD 2
+        # is nearly full on disk, so (0 -> 2) is dropped.
+        state = make_state({0: (1, 2), 1: (1, 2), 2: (1, 2)},
+                           {"1.0": ([2, 1], [(0, 2)]), "1.1": ([0, 1], [])})
+        state["backfillfull_ratio"] = 0.9
+        for osd in state["osds"].values():
+            osd["used"] = GiB
+        state["osds"][2]["used"] = int(9.5 * GiB)
+        coral.rebuild_upmaps(state, logger)
+        assert state["pgs"]["1.0"]["upmaps"] == []
+
+    def test_rebuild_keeps_upmap_whose_removal_would_pass_backfillfull(self, logger):
+        # Like test_drops_upmap_that_would_leave_source_under_floor: by PG
+        # count (0 -> 2) isn't worth keeping, but sending PG 1.0 back would put
+        # OSD 0 (8.5 GiB already used on disk) past 90% of 10 GiB.
+        state = make_state({0: (2, 2), 1: (2, 2), 2: (0, 0)},
+                           {"1.0": ([2, 1], [(0, 2)]), "1.1": ([0, 1], [])})
+        state["backfillfull_ratio"] = 0.9
+        for osd in state["osds"].values():
+            osd["used"] = GiB
+        state["osds"][0]["used"] = int(8.5 * GiB)
+        coral.rebuild_upmaps(state, logger)
+        assert state["pgs"]["1.0"]["upmaps"] == [(0, 2)]
+        assert not coral.is_past_backfillfull(state, 0)
+
+    def test_next_step_moves_fullest_shard_first(self):
+        raw = [0, 1, 2]
+        items = coral.next_upmap_step(raw, [0, 1, 2], [3, 4, 5], all_in, utilization={1: 0.5, 2: 0.9})
+        assert coral.apply_upmap_items(raw, items, all_in) == [0, 1, 5]
+
+    @staticmethod
+    def _round(pgs, plan, utilization, nearfull_ratio=0.85):
+        cluster = MagicMock()
+        cluster.mon_command.return_value = (0, b'', '')
+        result = coral.apply_upmap_round(cluster, plan, pgs, all_in, False, MagicMock(),
+                                         utilization=utilization, nearfull_ratio=nearfull_ratio)
+        sent = [json.loads(c.args[0])["pgid"] for c in cluster.mon_command.call_args_list]
+        return result, sent
+
+    def test_only_moves_off_nearfull_osds_start_while_any_remain(self):
+        pgs = {"1.0": stepping_pg([0, 1]), "1.1": stepping_pg([5, 6]),
+               "1.2": stepping_pg([3, 1], upmaps=[(0, 3), (7, 8)])}    # only drops a dead item
+        plan = {"1.0": [2, 1], "1.1": [7, 6], "1.2": [3, 1]}
+        (started, remaining), sent = self._round(pgs, plan, {0: 0.9})
+        assert (started, remaining) == (2, 3)
+        assert set(sent) == {"1.0", "1.2"}
+
+    def test_nearfull_work_still_waiting_holds_others_back(self):
+        # 1.0 still has to move off nearfull OSD 0 but is busy backfilling
+        # something else, so it can't step this round — and 1.1 still waits.
+        pgs = {"1.0": stepping_pg([0, 1], acting=[0, 9], state="active+remapped+backfilling"),
+               "1.1": stepping_pg([5, 6])}
+        plan = {"1.0": [2, 1], "1.1": [7, 6]}
+        (started, remaining), sent = self._round(pgs, plan, {0: 0.9})
+        assert (started, remaining) == (0, 2)
+
+    def test_pg_leaving_nearfull_osd_steps_even_when_another_shard_must_go_first(self):
+        # 1.0 must leave nearfull OSD 0, but 0's slot goes to OSD 1, which is
+        # still in the PG: the first step has to move OSD 1's shard. That step
+        # is still the nearfull PG's progress — it must start, not deadlock.
+        pgs = {"1.0": stepping_pg([0, 1]), "1.1": stepping_pg([5, 6])}
+        plan = {"1.0": [1, 2], "1.1": [7, 6]}
+        (started, remaining), sent = self._round(pgs, plan, {0: 0.9})
+        assert sent == ["1.0"]
+
+    def test_stuck_nearfull_pg_does_not_hold_everything_back(self):
+        # 1.0's move off nearfull OSD 0 is stuck (its target is backfillfull);
+        # waiting on it would stall every other PG indefinitely.
+        pgs = {"1.0": stepping_pg([0, 1], acting=[0, 9], state="active+remapped+backfill_wait+backfill_toofull"),
+               "1.1": stepping_pg([5, 6])}
+        plan = {"1.0": [2, 1], "1.1": [7, 6]}
+        (started, remaining), sent = self._round(pgs, plan, {0: 0.9})
+        assert sent == ["1.1"]
+
+    def test_nearfull_osd_outside_the_plan_holds_nothing_back(self):
+        pgs = {"1.0": stepping_pg([0, 1]), "1.1": stepping_pg([5, 6])}
+        plan = {"1.0": [2, 1], "1.1": [7, 6]}
+        (started, remaining), sent = self._round(pgs, plan, {9: 0.95})
+        assert (started, remaining) == (2, 2)
+
+    def test_fullest_source_goes_first(self):
+        pgs = {"1.0": stepping_pg([0, 1]), "1.1": stepping_pg([5, 6])}
+        plan = {"1.0": [2, 1], "1.1": [7, 6]}
+        (started, _), sent = self._round(pgs, plan, {0: 0.88, 5: 0.95})
+        assert sent == ["1.1", "1.0"]
 
 
 class FakeSteppingCluster:
