@@ -301,13 +301,13 @@ class TestCalculatePgDistribution:
     def test_equal_weights_split_evenly(self, logger):
         state = self._state(
             {0: 1.0, 1: 1.0},
-            {1: {"crush_rule": 0, "pgs": 128, "size": 3}},
+            {1: {"crush_rule": 0, "pgs": 128, "size": 2}},
             valid_osds=[0, 1],
         )
         coral.calculate_pg_distribution(state, logger)
-        # 0.5 * 128 * 3 = 192
-        assert state["osds"][0]["target_pgs_by_pool"][1] == (192, 192)
-        assert state["osds"][1]["target_pgs_by_pool"][1] == (192, 192)
+        # 0.5 * 128 * 2 = 128
+        assert state["osds"][0]["target_pgs_by_pool"][1] == (128, 128)
+        assert state["osds"][1]["target_pgs_by_pool"][1] == (128, 128)
 
     def test_uneven_division_floors_and_ceils(self, logger):
         state = self._state(
@@ -323,34 +323,34 @@ class TestCalculatePgDistribution:
     def test_zero_weight_osd_gets_zero_target(self, logger):
         state = self._state(
             {0: 1.0, 1: 1.0, 2: 0.0},
-            {1: {"crush_rule": 0, "pgs": 128, "size": 3}},
+            {1: {"crush_rule": 0, "pgs": 128, "size": 2}},
             valid_osds=[0, 1, 2],
         )
         coral.calculate_pg_distribution(state, logger)
         assert state["osds"][2]["target_pgs_by_pool"][1] == (0, 0)
-        # The two real OSDs split the full 384 PG·replicas
-        assert state["osds"][0]["target_pgs_by_pool"][1] == (192, 192)
-        assert state["osds"][1]["target_pgs_by_pool"][1] == (192, 192)
+        # The two real OSDs split the full 256 PG·replicas
+        assert state["osds"][0]["target_pgs_by_pool"][1] == (128, 128)
+        assert state["osds"][1]["target_pgs_by_pool"][1] == (128, 128)
 
     def test_tiny_weight_treated_as_zero(self, logger):
         state = self._state(
             {0: 1.0, 1: 0.00005},  # below 0.0001 threshold
-            {1: {"crush_rule": 0, "pgs": 128, "size": 3}},
+            {1: {"crush_rule": 0, "pgs": 128, "size": 1}},
             valid_osds=[0, 1],
         )
         coral.calculate_pg_distribution(state, logger)
         assert state["osds"][1]["target_pgs_by_pool"][1] == (0, 0)
-        assert state["osds"][0]["target_pgs_by_pool"][1] == (384, 384)
+        assert state["osds"][0]["target_pgs_by_pool"][1] == (128, 128)
 
     def test_ec_pool_uses_size_as_k_plus_m(self, logger):
         state = self._state(
-            {0: 1.0, 1: 1.0},
+            {o: 1.0 for o in range(22)},
             {1: {"crush_rule": 0, "pgs": 64, "size": 11}},  # 8+3 EC
-            valid_osds=[0, 1],
+            valid_osds=list(range(22)),
         )
         coral.calculate_pg_distribution(state, logger)
-        # 0.5 * 64 * 11 = 352
-        assert state["osds"][0]["target_pgs_by_pool"][1] == (352, 352)
+        # 64 * 11 / 22 = 32
+        assert state["osds"][0]["target_pgs_by_pool"][1] == (32, 32)
 
     def test_osd_not_in_valid_osds_has_no_entry_for_that_pool(self, logger):
         state = self._state(
@@ -376,19 +376,43 @@ class TestCalculatePgDistribution:
         # OSDs 0 and 1 split the full pool share between themselves.
         state = self._state(
             {0: 1.0, 1: 1.0, 2: 1.0},
-            {1: {"crush_rule": 0, "pgs": 128, "size": 3}},
+            {1: {"crush_rule": 0, "pgs": 128, "size": 2}},
             valid_osds=[0, 1, 2],
             in_status={0: 1, 1: 1, 2: 0},
         )
         coral.calculate_pg_distribution(state, logger)
         assert state["osds"][2]["target_pgs_by_pool"][1] == (0, 0)
-        assert state["osds"][0]["target_pgs_by_pool"][1] == (192, 192)
-        assert state["osds"][1]["target_pgs_by_pool"][1] == (192, 192)
+        assert state["osds"][0]["target_pgs_by_pool"][1] == (128, 128)
+        assert state["osds"][1]["target_pgs_by_pool"][1] == (128, 128)
+
+    def test_oversized_failure_domain_is_capped_at_one_shard_per_pg(self, logger):
+        # EC 4+3 over cages: cage "big" has 22 of 148 weight, i.e. 133.2 of the
+        # 896 shards, but a PG can only put one shard in it: 128.
+        weights = {0: 8.0, 1: 14.0, **{o: 14.0 for o in range(2, 10)}, 10: 14.0}
+        cages = {0: "big", 1: "big", **{o: f"cage{o}" for o in range(2, 11)}}
+        state = self._state(weights, {1: {"crush_rule": 0, "pgs": 128, "size": 7}},
+                            valid_osds=list(weights))
+        state["crush_rules"][0]["steps"] = [{"op": "chooseleaf_indep", "num": 0, "type": "cage"}]
+        state["osd_bucket_maps"] = {"cage": cages}
+        coral.calculate_pg_distribution(state, logger)
+        targets = {o: state["osds"][o]["target_pgs_by_pool"][1] for o in weights}
+        assert targets[0] == (46, 47) and targets[1] == (81, 82)    # 128 * 8/22, 128 * 14/22
+        # the 768 shards left are shared by the other 126 weight: 85.33 per cage
+        assert all(targets[o] == (85, 86) for o in range(2, 11))
+
+    def test_capped_ideals_repeats_until_no_domain_is_over(self):
+        # 3 shards per PG over 4 domains. A has half the weight: capped at 10
+        # (of 30 shards); then B's share of the remaining 20 (12.5 of 20 over
+        # weight 4) is too much as well.
+        weights = {0: 8.0, 1: 5.0, 2: 1.5, 3: 1.5}
+        ideals = coral.capped_ideals(weights, {0: "A", 1: "B", 2: "C", 3: "D"}, 10, 3)
+        assert ideals == {0: 10, 1: 10, 2: 5, 3: 5}
 
     def test_invoked_by_get_cluster_state(self, mock_cluster, logger):
         state = coral.get_cluster_state(mock_cluster, logger)
-        # Fixture: 2 equal-weight OSDs, pool 1 with 128 PGs, size 3
-        assert state["osds"][0]["target_pgs_by_pool"][1] == (192, 192)
+        # Fixture: 2 equal-weight OSDs, pool 1 with 128 PGs, size 3. Each OSD
+        # can hold one copy of each PG at most.
+        assert state["osds"][0]["target_pgs_by_pool"][1] == (128, 128)
 
 
 class TestCalculateUsage:

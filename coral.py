@@ -482,7 +482,7 @@ def get_rule_failure_domain(rule):
     Get the last choose/chooseleaf step before an emit in the CRUSH rule.
     """
 
-    # Search for chooseleaf first
+    last_step = None
     for step in rule.get('steps', []):
         op = step.get('op', '')
         if op.startswith('chooseleaf_') or op.startswith('choose_'):
@@ -581,17 +581,52 @@ def calculate_pg_distribution(cluster_state, logger):
                 continue
             w = osd['crush_weight']
             weights[osd_id] = w if w >= 0.0001 else 0.0
-        total_weight = sum(weights.values())
+        bucket_map = cluster_state.get('osd_bucket_maps', {}).get(get_rule_failure_domain(
+            cluster_state['crush_rules'][pool['crush_rule']]), {})
+        ideals = capped_ideals(weights, bucket_map, pool['pgs'], pool['size'])
 
-        for osd_id, weight in weights.items():
-            if total_weight == 0:
-                ideal = 0.0
-            else:
-                ideal = (weight / total_weight) * pool['pgs'] * pool['size']
+        for osd_id, ideal in ideals.items():
             cluster_state['osds'][osd_id]['target_pgs_by_pool'][pool_id] = (
-                math.floor(ideal),
-                math.ceil(ideal),
+                math.floor(ideal + 1e-9),
+                math.ceil(ideal - 1e-9),
             )
+
+def capped_ideals(weights, bucket_map, pg_num, size):
+    """{osd: ideal shard count} for one pool: a CRUSH-weight share of
+    pg_num * size, except that a failure domain can hold at most one shard of
+    each PG.
+
+    A domain whose weight share is more than pg_num shards gets exactly
+    pg_num, split among its OSDs by weight, and the shards it can't take are
+    shared among the other domains by weight (repeated until no domain is
+    over). Without this, OSDs in an oversized domain get targets they can
+    never reach, and the overflow lands on other OSDs unplanned.
+    """
+    domain_of = {o: bucket_map.get(o, ('osd', o)) for o in weights}
+    domain_weight = defaultdict(float)
+    for osd_id, weight in weights.items():
+        domain_weight[domain_of[osd_id]] += weight
+    capped = set()
+    while True:
+        open_weight = sum(w for d, w in domain_weight.items() if d not in capped)
+        open_shards = pg_num * size - pg_num * len(capped)
+        if open_weight <= 0:
+            break
+        over = {d for d, w in domain_weight.items()
+                if d not in capped and w > 0 and w / open_weight * open_shards > pg_num}
+        if not over:
+            break
+        capped |= over
+    ideals = {}
+    for osd_id, weight in weights.items():
+        domain = domain_of[osd_id]
+        if weight <= 0:
+            ideals[osd_id] = 0.0
+        elif domain in capped:
+            ideals[osd_id] = pg_num * weight / domain_weight[domain]
+        else:
+            ideals[osd_id] = weight / open_weight * open_shards
+    return ideals
 
 # Loop through each pg in a pool and add the appropriate amount to each OSD
 def calculate_usage(cluster_state, logger):
