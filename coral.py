@@ -70,7 +70,8 @@ def main():
                 # Step every PG toward its target one shard at a time,
                 # re-planning if the cluster changes underneath us
                 while run_upmap_plan(cluster, plan, fingerprint, args.interval, logger,
-                                     failure_domains=pool_failure_domains(cluster_state)) == 'replan':
+                                     failure_domains=pool_failure_domains(cluster_state),
+                                     pool_osds=pool_rule_osds(cluster_state)) == 'replan':
                     cluster_state = get_cluster_state(cluster, logger)
                     calculate_usage(cluster_state, logger)
                     plan, fingerprint = plan_upmaps(cluster, cluster_state, logger)
@@ -1064,16 +1065,25 @@ def failure_domain_conflicts(up, bucket_of):
     buckets = [b for b in buckets if b is not None]
     return len(buckets) - len(set(buckets))
 
-def next_upmap_step(raw, current_up, target_up, is_in, utilization=None, bucket_of=None):
+def next_upmap_step(raw, current_up, target_up, is_in, utilization=None, bucket_of=None, spares=None,
+                    spare_rank=None):
     """pg_upmap_items for the smallest step toward target_up, or None.
 
     Normally that moves exactly one shard, off the fullest OSD first (per
     utilization, {osd: used fraction}). Every intermediate up set must keep
     the PG's failure domains distinct (bucket_of: osd -> bucket): if it doesn't,
     the mon's upmap check (OSDMap::check_pg_upmaps -> verify_upmap) cancels
-    every upmap item of the PG, not just the new one. When no single-shard step
-    is valid — e.g. two shards trading failure domains — change the fewest
-    shards together that is.
+    every upmap item of the PG, not just the new one.
+
+    No single-shard step is valid when shards have to trade failure domains:
+    shard 1 moves into the domain shard 2 is leaving, shard 2 into the one
+    shard 3 is leaving, ... back to shard 1. Then one shard of that cycle hops
+    to a temporary OSD in a failure domain the PG neither uses nor wants
+    (spares: {bucket: [osd, ...]}, best first per spare_rank), which frees its
+    domain; the rest of the cycle can then move one shard at a time, and the
+    hopping shard moves on to its target last. That costs one extra shard move
+    but never moves several shards of a PG at once. Without a usable spare,
+    change the fewest shards together that is valid.
     """
     if not (len(raw) == len(current_up) == len(target_up)):
         return None
@@ -1081,18 +1091,65 @@ def next_upmap_step(raw, current_up, target_up, is_in, utilization=None, bucket_
     allowed = failure_domain_conflicts(target_up, bucket_of) if bucket_of else 0
     differing = sorted((i for i in range(len(current_up)) if current_up[i] != target_up[i]),
                        key=lambda i: (-utilization.get(current_up[i], 0), i))
-    for size in range(1, len(differing) + 1):
+
+    def items_if_valid(step_up):
+        if len(set(step_up)) != len(step_up):
+            return None     # a target OSD is still in another slot that isn't changing yet
+        if bucket_of and failure_domain_conflicts(step_up, bucket_of) > allowed:
+            return None
+        return items_for_up(raw, step_up, is_in)
+
+    def toward(up, positions):
+        step_up = list(up)
+        for i in positions:
+            step_up[i] = target_up[i]
+        return step_up
+
+    for i in differing:
+        items = items_if_valid(toward(current_up, (i,)))
+        if items is not None:
+            return items
+
+    if spares:
+        items = hop_step(current_up, target_up, differing, spares, spare_rank, bucket_of,
+                         items_if_valid, toward)
+        if items is not None:
+            return items
+
+    for size in range(2, len(differing) + 1):
         for combo in itertools.combinations(differing, size):
-            step_up = list(current_up)
-            for i in combo:
-                step_up[i] = target_up[i]
-            if len(set(step_up)) != len(step_up):
-                continue    # a target OSD is still in another slot that isn't changing yet
-            if bucket_of and failure_domain_conflicts(step_up, bucket_of) > allowed:
-                continue
-            items = items_for_up(raw, step_up, is_in)
+            items = items_if_valid(toward(current_up, combo))
             if items is not None:
                 return items
+    return None
+
+def hop_step(current_up, target_up, differing, spares, spare_rank, bucket_of, items_if_valid, toward):
+    """Items moving one shard to a temporary OSD so the rest of the PG can step
+    one shard at a time, or None. See next_upmap_step()."""
+    def domain(osd_id):
+        return bucket_of(osd_id) if bucket_of else osd_id
+    used = {domain(o) for o in list(current_up) + list(target_up) if o != CRUSH_ITEM_NONE}
+    free = [o for d, group in spares.items() if d is not None and d not in used for o in group]
+    if not free:
+        return None
+    free.sort(key=spare_rank)
+    for i in differing:
+        if current_up[i] == CRUSH_ITEM_NONE:
+            continue
+        freed = domain(current_up[i])
+        # only worth it if another shard is waiting for this shard's domain
+        if not any(domain(target_up[j]) == freed for j in differing if j != i):
+            continue
+        for spare in free:
+            hop_up = list(current_up)
+            hop_up[i] = spare
+            items = items_if_valid(hop_up)
+            if items is None:
+                continue
+            # the hop must let some shard reach its target on its own next
+            if any(items_if_valid(toward(hop_up, (j,))) is not None for j in differing if j != i):
+                return items
+            break   # which domain is freed decides that, not which spare; try another shard
     return None
 
 def is_pg_settled(pg):
@@ -1157,6 +1214,11 @@ def pool_failure_domains(cluster_state):
         domains[pool_id] = cluster_state['osd_bucket_maps'].get(get_rule_failure_domain(rule), {})
     return domains
 
+def pool_rule_osds(cluster_state):
+    """{pool_id: OSDs the pool's CRUSH rule can place shards on}."""
+    return {pool_id: cluster_state['crush_rules'][pool['crush_rule']]['valid_osds']
+            for pool_id, pool in cluster_state['pools'].items()}
+
 def plan_upmaps(cluster, cluster_state, logger):
     """Compute target placements. Returns (plan, fingerprint of the cluster it was made for)."""
     fingerprint = plan_fingerprint(get_osd_dump(cluster))
@@ -1189,7 +1251,7 @@ def send_upmap_items(cluster, pgid, items, is_dryrun, logger):
     return True
 
 def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger, utilization=None, nearfull_ratio=None,
-                      failure_domains=None):
+                      failure_domains=None, spare_osds=None):
     """Start the next single-shard change on every settled PG not yet at its target.
 
     All of a PG's backfill flows through its primary, and the PG holds a backfill
@@ -1206,11 +1268,29 @@ def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger, utilization=
 
     utilization is {osd: used fraction}; failure_domains is {pool_id: {osd:
     bucket}} for the pool rule's failure domain, used to keep every
-    intermediate step valid. Returns (changes started, PGs not yet at their
-    target).
+    intermediate step valid. spare_osds is {pool_id: [osd, ...]}, the up and
+    in OSDs the pool's rule can use: when shards have to trade failure domains,
+    one hops to the least loaded of these first (see next_upmap_step()).
+    Returns (changes started, PGs not yet at their target).
     """
     utilization = utilization or {}
     failure_domains = failure_domains or {}
+    spare_osds = spare_osds or {}
+    hops = defaultdict(int)     # temporary homes picked this round, to spread them out
+    spares_by_pool = {}
+
+    def spares_for(pool_id, bucket_map):
+        """{bucket: [osd, ...]} of the pool's spare OSDs that aren't nearfull."""
+        if pool_id not in spares_by_pool:
+            groups = defaultdict(list)
+            for osd_id in spare_osds.get(pool_id, ()):
+                if not is_nearfull(osd_id):
+                    groups[bucket_map.get(osd_id) if bucket_map is not None else osd_id].append(osd_id)
+            spares_by_pool[pool_id] = groups
+        return spares_by_pool[pool_id]
+
+    def spare_rank(osd_id):
+        return hops[osd_id], utilization.get(osd_id, 0), osd_id
 
     def is_nearfull(osd_id):
         return nearfull_ratio is not None and utilization.get(osd_id, 0) >= nearfull_ratio
@@ -1243,9 +1323,11 @@ def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger, utilization=
             # Placement is right; just drop items that no longer do anything
             items = final_items
         else:
-            bucket_map = failure_domains.get(int(pgid.split('.')[0]))
+            pool_id = int(pgid.split('.')[0])
+            bucket_map = failure_domains.get(pool_id)
             items = next_upmap_step(raw, pg['up'], target_up, is_in, utilization,
-                                    bucket_map.get if bucket_map is not None else None)
+                                    bucket_map.get if bucket_map is not None else None,
+                                    spares_for(pool_id, bucket_map), spare_rank)
             if items is None:
                 # No valid smaller step; make the whole move at once
                 logger.warning(f"No valid step for {pgid} from {pg['up']} to {target_up}; moving it in one change")
@@ -1253,7 +1335,13 @@ def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger, utilization=
         if items is None:
             logger.warning(f"Can't express {pgid} target {target_up} as upmap items from CRUSH set {raw}; skipping")
             continue
-        moves_data = apply_upmap_items(raw, items, is_in) != pg['up']
+        step_up = apply_upmap_items(raw, items, is_in)
+        for osd_id in step_up:
+            if osd_id not in target_up and osd_id not in pg['up']:
+                hops[osd_id] += 1
+                logger.info(f"{pgid}: moving a shard to osd.{osd_id} temporarily so its other shards "
+                            f"can trade failure domains one at a time")
+        moves_data = step_up != pg['up']
         steps.append((pgid, items, urgency, moves_data))
 
     if urgent_in_progress or any(s[2] for s in steps):
@@ -1270,11 +1358,13 @@ def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger, utilization=
             started += 1
     return started, remaining
 
-def run_upmap_plan(cluster, plan, fingerprint, interval, logger, sleep=time.sleep, failure_domains=None):
+def run_upmap_plan(cluster, plan, fingerprint, interval, logger, sleep=time.sleep, failure_domains=None,
+                   pool_osds=None):
     """Apply a plan one shard per PG per round, every interval seconds.
 
     Returns 'done' once every PG is at its target, or 'replan' if OSDs, weights,
-    pools or the CRUSH map changed since the plan was made.
+    pools or the CRUSH map changed since the plan was made. pool_osds is
+    {pool_id: OSDs its CRUSH rule can use}, the candidates for temporary hops.
     """
     round_no = 0
     while True:
@@ -1284,13 +1374,16 @@ def run_upmap_plan(cluster, plan, fingerprint, interval, logger, sleep=time.slee
             logger.warning("OSDs, weights, pools or the CRUSH map changed since planning; re-planning")
             return 'replan'
         in_osds = {o['osd'] for o in osd_dump['osds'] if o['in']}
+        up_in_osds = {o['osd'] for o in osd_dump['osds'] if o['in'] and o['up']}
         pg_dump = get_pg_dump(cluster)
         pgs = get_pg_info(cluster, logger, pg_dump)
         started, remaining = apply_upmap_round(
             cluster, plan, pgs, in_osds.__contains__, False, logger,
             utilization=osd_utilization(pg_dump),
             nearfull_ratio=osd_dump.get('nearfull_ratio', 0.85),
-            failure_domains=failure_domains)
+            failure_domains=failure_domains,
+            spare_osds={pool_id: [o for o in osd_ids if o in up_in_osds]
+                        for pool_id, osd_ids in (pool_osds or {}).items()})
         logger.info(f"Round {round_no}: started {started} single-shard change(s); "
                     f"{remaining} PG(s) not yet at their target")
         if remaining == 0:
@@ -1311,7 +1404,10 @@ def print_upmap_plan(cluster_state, plan, interval, logger):
     started, remaining = apply_upmap_round(None, plan, pgs, is_in, True, logger,
                                            utilization=utilization,
                                            nearfull_ratio=cluster_state.get('nearfull_ratio'),
-                                           failure_domains=pool_failure_domains(cluster_state))
+                                           failure_domains=pool_failure_domains(cluster_state),
+                                           spare_osds={pool_id: [o for o in osd_ids if osds.get(o, {}).get('up')
+                                                                 and is_in(o)]
+                                                       for pool_id, osd_ids in pool_rule_osds(cluster_state).items()})
     shard_moves = sum(
         sum(1 for a, b in zip(pgs[pgid]['up'], target_up) if a != b)
         for pgid, target_up in plan.items()

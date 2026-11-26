@@ -1028,6 +1028,49 @@ class TestUpmapItemHelpers:
         items = coral.next_upmap_step(raw, [5, 6], [0, 6], all_in)
         assert items == [(1, 6)]
 
+    # Three shards trading racks in a cycle: shard 0 moves into rack B (which
+    # shard 1 is leaving), shard 1 into C (shard 2) and shard 2 into A (shard
+    # 0). No shard can move alone. Rack D is free.
+    RACK = {0: "A", 1: "B", 2: "C", 3: "B", 4: "C", 5: "A", 6: "D", 7: "D"}
+    CYCLE_TARGET = [3, 4, 5]
+
+    def walk(self, raw, target, **kwargs):
+        """Step from raw to target; return the up sets visited."""
+        ups, items = [list(raw)], []
+        while ups[-1] != target:
+            items = coral.next_upmap_step(raw, ups[-1], target, all_in, bucket_of=self.RACK.get, **kwargs)
+            ups.append(coral.apply_upmap_items(raw, items, all_in))
+            assert len(ups) < 10
+        return ups
+
+    def test_cycle_hops_one_shard_through_a_free_domain(self):
+        spares = {"A": [5], "B": [3], "C": [4], "D": [6, 7]}
+        ups = self.walk([0, 1, 2], self.CYCLE_TARGET, spares=spares, spare_rank=lambda o: -o)
+        # one shard at a time, four moves instead of three, every step valid
+        for before, after in zip(ups, ups[1:]):
+            assert sum(a != b for a, b in zip(before, after)) == 1
+            assert coral.failure_domain_conflicts(after, self.RACK.get) == 0
+        assert len(ups) == 5
+        assert 7 in ups[1]      # spare_rank picks the temporary home
+
+    def test_cycle_without_a_free_domain_moves_together(self):
+        # without spares, or with spares only in racks the PG uses or wants
+        for spares in (None, {"A": [5], "B": [3], "C": [4]}):
+            ups = self.walk([0, 1, 2], self.CYCLE_TARGET, spares=spares, spare_rank=lambda o: o)
+            assert ups == [[0, 1, 2], self.CYCLE_TARGET]
+
+    def test_round_spreads_hops_and_avoids_nearfull_spares(self, logger):
+        cluster = MagicMock()
+        cluster.mon_command.return_value = (0, b'', '')
+        rack = {**self.RACK, 8: "D"}
+        pgs = {"1.0": stepping_pg([0, 1, 2]), "1.1": stepping_pg([0, 1, 2])}
+        plan = {pgid: self.CYCLE_TARGET for pgid in pgs}
+        coral.apply_upmap_round(cluster, plan, pgs, all_in, False, logger,
+                                utilization={6: 0.9, 7: 0.1, 8: 0.2}, nearfull_ratio=0.85,
+                                failure_domains={1: rack}, spare_osds={1: [6, 7, 8]})
+        homes = [set(json.loads(c.args[0])["id"]) & {6, 7, 8} for c in cluster.mon_command.call_args_list]
+        assert homes == [{7}, {8}]
+
 
 def stepping_pg(up, acting=None, state="active+clean", upmaps=()):
     return {"up": list(up), "acting": list(acting if acting is not None else up),
@@ -1243,6 +1286,15 @@ class TestRunUpmapPlan:
         assert sum(1 for c in fake.commands if c[0] == "1.0") == 3
         assert sum(1 for c in fake.commands if c[0] == "1.1") == 2
         assert sleeps and set(sleeps) == {60}
+
+    def test_cycles_step_one_shard_at_a_time(self, logger):
+        fake = FakeSteppingCluster({"1.0": [0, 1, 2]})
+        fingerprint = coral.plan_fingerprint(json.loads(fake.mon_command('{"prefix": "osd dump"}', b"")[1]))
+        rack = {0: "A", 1: "B", 2: "C", 3: "B", 4: "C", 5: "A", 6: "D"}
+        result = coral.run_upmap_plan(fake, {"1.0": [3, 4, 5]}, fingerprint, 60, logger, sleep=lambda s: None,
+                                      failure_domains={1: rack}, pool_osds={1: list(rack)})
+        assert result == "done" and fake.up("1.0") == [3, 4, 5]
+        assert [sum(a != b for a, b in zip(before, after)) for _, before, after in fake.commands] == [1, 1, 1, 1]
 
     def test_replans_when_the_cluster_changes(self, logger):
         fake = FakeSteppingCluster({"1.0": [0, 1, 2]})
