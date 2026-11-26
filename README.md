@@ -22,6 +22,20 @@ Coral (Clyso Optimized RebALancer) is a Ceph cluster rebalancing tool. It analyz
 | `--preview` | Show current and future OSD usage based on existing PG up/acting sets only — no rebalancing computation, no cluster writes, no log file writes. |
 | `--preview-pgs` | After the usage table, also print a per-OSD breakdown of future PGs by pool with their target floor/ceil. |
 
+## Pre-flight checks
+
+Before anything else, coral checks the cluster and prints what it finds, in every mode:
+
+- **Errors** stop `--apply` before it changes anything (a dry run still prints its plan):
+  - the mgr balancer is on (`ceph balancer off`): it would fight coral's changes;
+  - `require_min_compat_client` is older than luminous: the mons reject upmap commands.
+- **Warnings**:
+  - `norebalance` or `nobackfill` is set: no data moves, so with `--apply` coral starts no new changes until the flag is unset (it keeps checking every round);
+  - `norecover` is set: degraded PGs won't recover, and coral only steps a PG once it's active+clean;
+  - the balancer's state couldn't be read.
+
+While running, coral stops if the balancer is turned on, and retries a round if a query to the mons fails (giving up after 5 failed rounds in a row). Any failed query exits with an error instead of a traceback.
+
 ## How it works
 
 1. **Gather cluster state** — OSD capacity and status, PG placement (acting and up sets), pool metadata, CRUSH rules (including the set of OSDs each rule can target), and the cluster `backfillfull_ratio`. Per-OSD min/max PG targets for each pool are also derived from each OSD's CRUSH-weight share among the rule's eligible OSDs, scaled by `pg_num` and pool size.

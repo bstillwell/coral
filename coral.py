@@ -42,6 +42,25 @@ def main():
     logger.debug("Connecting to Ceph cluster")
     cluster = rados.Rados(conffile="/etc/ceph/ceph.conf")
     cluster.connect()
+    try:
+        run_coral(cluster, args, is_preview, is_dryrun, logger)
+    except (CephCommandError, PreflightError) as e:
+        logger.error(str(e))
+        if is_preview:
+            print(f"{RED}ERROR: {e}{RESET}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        # Disconnect from the cluster
+        logger.debug("Disconnecting from Ceph cluster")
+        cluster.shutdown()
+
+def run_coral(cluster, args, is_preview, is_dryrun, logger):
+    # Check for anything that would fight or block coral's changes
+    osd_dump = get_osd_dump(cluster)
+    errors, warnings = preflight_checks(cluster, osd_dump)
+    print_preflight(errors, warnings, logger)
+    if errors and not is_dryrun:
+        raise PreflightError("Not applying any changes until the errors above are fixed")
 
     # Get the current state of the cluster
     cluster_state = get_cluster_state(cluster, logger)
@@ -51,7 +70,7 @@ def main():
 
     # Pools that are splitting PGs: hold their data in place until the split
     # is done, then balance
-    splitting = splitting_pools(get_osd_dump(cluster))
+    splitting = splitting_pools(osd_dump)
     if splitting:
         announce_splits(splitting)
         if not is_dryrun:
@@ -59,7 +78,6 @@ def main():
                 cluster_state = wait_out_splits(cluster, cluster_state, args.interval, logger)
             except KeyboardInterrupt:
                 logger.info("Interrupted while holding splits in place. Re-run to continue.")
-                cluster.shutdown()
                 return
             splitting = {}
 
@@ -101,10 +119,6 @@ def main():
             except KeyboardInterrupt:
                 logger.info("Interrupted; stopping between rounds. Re-run to continue.")
 
-    # Disconnect from the cluster
-    logger.debug("Disconnecting from Ceph cluster")
-    cluster.shutdown()
-
 def wait_out_splits(cluster, cluster_state, interval, logger):
     """Hold splitting pools' data in place until no pool is splitting, then
     return a fresh cluster state to plan the balance from."""
@@ -142,10 +156,93 @@ def setup_logging(log_file, is_preview=False):
 
     return logger
 
-def get_pg_dump(cluster):
-    cmd = {'prefix': 'pg dump', 'format': 'json'}
+class CephCommandError(Exception):
+    """A Ceph query failed or returned something that isn't JSON."""
+
+def mon_json(cluster, prefix, **args):
+    """Run a read-only mon command and return its parsed JSON output."""
+    cmd = {'prefix': prefix, **args, 'format': 'json'}
     ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
-    return json.loads(output.decode('utf-8'))
+    if ret != 0:
+        raise CephCommandError(f"'ceph {prefix}' failed ({ret}): {errs}")
+    try:
+        return json.loads(output.decode('utf-8'))
+    except ValueError as e:
+        raise CephCommandError(f"'ceph {prefix}' returned output that isn't JSON: {e}") from None
+
+class PreflightError(Exception):
+    """Something would fight or undo coral's changes; stop instead of applying them."""
+
+# Flags that stop backfill of PGs that are only misplaced, i.e. every move coral makes
+BACKFILL_BLOCKING_FLAGS = {'norebalance', 'nobackfill'}
+
+# Releases older than luminous, which can't decode pg_upmap_items
+PRE_LUMINOUS = {'argonaut', 'bobtail', 'cuttlefish', 'dumpling', 'emperor', 'firefly', 'giant',
+                'hammer', 'infernalis', 'jewel', 'kraken'}
+
+BALANCER_ON = ("The mgr balancer is active and would fight coral's changes. "
+               "Turn it off with 'ceph balancer off' while coral runs.")
+
+def osd_flags(osd_dump):
+    """The cluster-wide OSD flags (noout, norebalance, ...) from osd dump."""
+    flags = {f for f in osd_dump.get('flags', '').split(',') if f}
+    flags.update(osd_dump.get('flags_set', []))
+    return flags
+
+def balancer_active(cluster):
+    """Whether the mgr balancer is on, or None if that couldn't be checked."""
+    cmd = {'prefix': 'balancer status', 'format': 'json'}
+    ret, output, errs = cluster.mgr_command(json.dumps(cmd), b'', timeout=5)
+    if ret != 0:
+        return None
+    try:
+        return bool(json.loads(output.decode('utf-8'))['active'])
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+def check_balancer_off(cluster):
+    """Stop if someone turned the mgr balancer on while coral is running."""
+    if balancer_active(cluster):
+        raise PreflightError(BALANCER_ON)
+
+def preflight_checks(cluster, osd_dump):
+    """(errors, warnings) about the cluster before coral changes anything.
+    Errors stop --apply; warnings are things the user should know about."""
+    errors, warnings = [], []
+    active = balancer_active(cluster)
+    if active:
+        errors.append(BALANCER_ON)
+    elif active is None:
+        warnings.append("Couldn't check whether the mgr balancer is on ('ceph balancer status'). "
+                        "If it is, turn it off with 'ceph balancer off': it would fight coral's changes.")
+    client = osd_dump.get('require_min_compat_client', '')
+    if client in PRE_LUMINOUS:
+        errors.append(f"require_min_compat_client is {client}, but upmap needs luminous or later. Check that "
+                      f"no older clients are connected ('ceph features'), then run "
+                      f"'ceph osd set-require-min-compat-client luminous'.")
+    flags = osd_flags(osd_dump)
+    for flag in sorted(flags & BACKFILL_BLOCKING_FLAGS):
+        warnings.append(f"The {flag} flag is set, so no data moves. With --apply, coral starts no new "
+                        f"changes while it's set ('ceph osd unset {flag}').")
+    if 'norecover' in flags:
+        warnings.append("The norecover flag is set: degraded PGs won't recover, and coral only steps a PG "
+                        "once it's active+clean ('ceph osd unset norecover').")
+    return errors, warnings
+
+def print_preflight(errors, warnings, logger):
+    """Show pre-flight problems on stdout (even with --preview) and in the log file."""
+    for msg in errors:
+        print(f"{RED}ERROR: {msg}{RESET}")
+        logger.debug(f"Pre-flight error: {msg}")
+    for msg in warnings:
+        print(f"{YELLOW}WARNING: {msg}{RESET}")
+        logger.debug(f"Pre-flight warning: {msg}")
+
+# Consecutive failed rounds (a query to the mons failed) before giving up
+MAX_FAILED_ROUNDS = 5
+
+def get_pg_dump(cluster):
+    return mon_json(cluster, 'pg dump')
 
 def get_cluster_state(cluster, logger):
     # 'pg dump' is by far the largest query, so fetch it once for both of its users
@@ -173,9 +270,7 @@ def get_osd_info(cluster, logger, pg_dump=None):
     logger.debug("Gathering info for OSDs")
 
     # Get the up/in status from 'osd dump'
-    cmd = {'prefix': 'osd dump', 'format': 'json'}
-    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
-    osd_dump = json.loads(output.decode('utf-8'))
+    osd_dump = mon_json(cluster, 'osd dump')
 
     for osd in osd_dump['osds']:
         osd_id = osd['osd']
@@ -187,9 +282,7 @@ def get_osd_info(cluster, logger, pg_dump=None):
     # Get the CRUSH weight and device class from the OSD nodes of the CRUSH
     # tree. The --show-shadow tree lists each OSD once per tree it's in, with
     # the same values each time.
-    cmd = {'prefix': 'osd crush tree', 'shadow': '--show-shadow', 'format': 'json'}
-    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
-    crush_tree = json.loads(output.decode('utf-8'))
+    crush_tree = mon_json(cluster, 'osd crush tree', shadow='--show-shadow')
 
     # Get each OSD's size and raw usage from the per-OSD stats in 'pg dump'.
     # An OSD that hasn't reported stats (e.g. down since the mgr started) has
@@ -236,9 +329,7 @@ def get_pg_info(cluster, logger, pg_dump=None):
         }
 
     # Grab the existing upmaps
-    cmd = {'prefix': 'osd dump', 'format': 'json'}
-    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
-    osd_dump = json.loads(output.decode('utf-8'))
+    osd_dump = mon_json(cluster, 'osd dump')
 
     # Convert the upmaps into a dictionary for easier access
     upmaps = {}
@@ -254,9 +345,7 @@ def get_pool_info(cluster, logger):
 
     # Grab name, type (replica/erasure) pg count, crush rule, and size (replica count/erase coding shards) for each pool.
     # 'osd dump' carries the same per-pool objects as 'osd pool ls detail' (keyed 'pool' instead of 'pool_id').
-    cmd = {'prefix': 'osd dump', 'format': 'json'}
-    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
-    osd_dump = json.loads(output.decode('utf-8'))
+    osd_dump = mon_json(cluster, 'osd dump')
 
     pool_info = {}
     for pool in osd_dump['pools']:
@@ -271,9 +360,7 @@ def get_pool_info(cluster, logger):
 
         # For erasure coded pools we need to grab the k/m from each profile
         if POOL_TYPE_NAMES[pool['type']] == 'erasure':
-            cmd = {'prefix': 'osd erasure-code-profile get', 'name': pool['erasure_code_profile'], 'format': 'json'}
-            ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
-            ec_profile = json.loads(output.decode('utf-8'))
+            ec_profile = mon_json(cluster, 'osd erasure-code-profile get', name=pool['erasure_code_profile'])
 
             pool_info[pool_id]['k'] = int(ec_profile['k'])
             pool_info[pool_id]['m'] = int(ec_profile['m'])
@@ -295,16 +382,12 @@ def get_crush_rules(cluster, logger):
     logger.debug("Gathering CRUSH rules")
 
     # Grab all the CRUSH rules
-    cmd = {'prefix': 'osd crush rule dump', 'format': 'json'}
-    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
-    crush_rule_dump = json.loads(output.decode('utf-8'))
+    crush_rule_dump = mon_json(cluster, 'osd crush rule dump')
 
     # Grab the CRUSH tree so we can resolve which OSDs each rule can target.
     # --show-shadow makes Ceph include the device-class shadow buckets (e.g.
     # 'default~hdd'), which class-scoped rules' `take` steps reference.
-    cmd = {'prefix': 'osd crush tree', 'shadow': '--show-shadow', 'format': 'json'}
-    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
-    crush_tree = json.loads(output.decode('utf-8'))
+    crush_tree = mon_json(cluster, 'osd crush tree', shadow='--show-shadow')
 
     nodes = {n['id']: n for n in crush_tree.get('nodes', [])}
     name_to_id = {n['name']: n['id'] for n in crush_tree.get('nodes', [])}
@@ -334,9 +417,7 @@ def get_backfillfull_ratio(cluster, logger):
     logger.debug("Fetching backfillfull_ratio")
 
     # Grab the cluster's full ratio so we know the max percentage full an OSD can be
-    cmd = {'prefix': 'osd dump', 'format': 'json'}
-    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
-    osd_dump = json.loads(output.decode('utf-8'))
+    osd_dump = mon_json(cluster, 'osd dump')
 
     backfillfull_ratio = osd_dump.get('backfillfull_ratio')
     if backfillfull_ratio is None:
@@ -419,9 +500,7 @@ def get_osd_bucket_maps(cluster, logger):
     logger.debug("Gathering CRUSH rules")
 
     # Grab all the CRUSH rules
-    cmd = {'prefix': 'osd crush rule dump', 'format': 'json'}
-    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
-    crush_rule_dump = json.loads(output.decode('utf-8'))
+    crush_rule_dump = mon_json(cluster, 'osd crush rule dump')
 
     crush_rules = {}
     for rule in crush_rule_dump:
@@ -441,9 +520,7 @@ def get_osd_bucket_maps(cluster, logger):
 
     # Grab the same --show-shadow tree get_crush_rules() uses, so a capture of
     # the cluster only needs that one tree.
-    cmd = {'prefix': 'osd crush tree', 'shadow': '--show-shadow', 'format': 'json'}
-    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
-    crush_tree = json.loads(output.decode('utf-8'))
+    crush_tree = mon_json(cluster, 'osd crush tree', shadow='--show-shadow')
 
     logger.debug("Building failure-domain to OSDs maps")
 
@@ -1189,9 +1266,7 @@ def is_pg_settled(pg):
     return {'active', 'clean'} <= state and 'remapped' not in state and pg['up'] == pg['acting']
 
 def get_osd_dump(cluster):
-    cmd = {'prefix': 'osd dump', 'format': 'json'}
-    ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
-    return json.loads(output.decode('utf-8'))
+    return mon_json(cluster, 'osd dump')
 
 def plan_fingerprint(osd_dump):
     """Everything the plan depends on except upmaps, which coral itself changes."""
@@ -1396,30 +1471,47 @@ def run_upmap_plan(cluster, plan, fingerprint, interval, logger, sleep=time.slee
     Returns 'done' once every PG is at its target, or 'replan' if OSDs, weights,
     pools or the CRUSH map changed since the plan was made. pool_osds is
     {pool_id: OSDs its CRUSH rule can use}, the candidates for temporary hops.
+    Starts nothing while norebalance or nobackfill is set, raises
+    PreflightError if the mgr balancer is turned on, and retries a round whose
+    queries failed (CephCommandError after MAX_FAILED_ROUNDS in a row).
     """
     round_no = 0
+    failed = 0
     while True:
         round_no += 1
-        osd_dump = get_osd_dump(cluster)
-        if plan_fingerprint(osd_dump) != fingerprint:
-            logger.warning("OSDs, weights, pools or the CRUSH map changed since planning; re-planning")
-            return 'replan'
-        in_osds = {o['osd'] for o in osd_dump['osds'] if o['in']}
-        up_in_osds = {o['osd'] for o in osd_dump['osds'] if o['in'] and o['up']}
-        pg_dump = get_pg_dump(cluster)
-        pgs = get_pg_info(cluster, logger, pg_dump)
-        started, remaining = apply_upmap_round(
-            cluster, plan, pgs, in_osds.__contains__, False, logger,
-            utilization=osd_utilization(pg_dump),
-            nearfull_ratio=osd_dump.get('nearfull_ratio', 0.85),
-            failure_domains=failure_domains,
-            spare_osds={pool_id: [o for o in osd_ids if o in up_in_osds]
-                        for pool_id, osd_ids in (pool_osds or {}).items()})
-        logger.info(f"Round {round_no}: started {started} single-shard change(s); "
-                    f"{remaining} PG(s) not yet at their target")
-        if remaining == 0:
-            logger.info("Every PG is at its target placement")
-            return 'done'
+        try:
+            osd_dump = get_osd_dump(cluster)
+            if plan_fingerprint(osd_dump) != fingerprint:
+                logger.warning("OSDs, weights, pools or the CRUSH map changed since planning; re-planning")
+                return 'replan'
+            check_balancer_off(cluster)
+            blocking = osd_flags(osd_dump) & BACKFILL_BLOCKING_FLAGS
+            if blocking:
+                logger.warning(f"Round {round_no}: {', '.join(sorted(blocking))} set; "
+                               f"not starting any changes until it's unset")
+            else:
+                in_osds = {o['osd'] for o in osd_dump['osds'] if o['in']}
+                up_in_osds = {o['osd'] for o in osd_dump['osds'] if o['in'] and o['up']}
+                pg_dump = get_pg_dump(cluster)
+                pgs = get_pg_info(cluster, logger, pg_dump)
+                started, remaining = apply_upmap_round(
+                    cluster, plan, pgs, in_osds.__contains__, False, logger,
+                    utilization=osd_utilization(pg_dump),
+                    nearfull_ratio=osd_dump.get('nearfull_ratio', 0.85),
+                    failure_domains=failure_domains,
+                    spare_osds={pool_id: [o for o in osd_ids if o in up_in_osds]
+                                for pool_id, osd_ids in (pool_osds or {}).items()})
+                logger.info(f"Round {round_no}: started {started} single-shard change(s); "
+                            f"{remaining} PG(s) not yet at their target")
+                if remaining == 0:
+                    logger.info("Every PG is at its target placement")
+                    return 'done'
+            failed = 0
+        except CephCommandError as e:
+            failed += 1
+            if failed >= MAX_FAILED_ROUNDS:
+                raise
+            logger.warning(f"Round {round_no}: {e}; trying again next round ({failed}/{MAX_FAILED_ROUNDS})")
         sleep(interval)
 
 def splitting_pools(osd_dump):
@@ -1496,20 +1588,31 @@ def pin_remapped_pgs(cluster, pgs, splitting, is_in, is_dryrun, logger, failure_
 
 def hold_splits(cluster, interval, logger, failure_domains=None, sleep=time.sleep):
     """While any pool is splitting, pin its remapped PGs in place every interval
-    seconds. Returns once no pool is splitting."""
+    seconds. Returns once no pool is splitting. Like run_upmap_plan(), stops if
+    the mgr balancer is turned on and retries rounds whose queries failed."""
     round_no = 0
+    failed = 0
     while True:
-        osd_dump = get_osd_dump(cluster)
-        splitting = splitting_pools(osd_dump)
-        if not splitting:
-            logger.info("No pool is splitting any more; planning the balance")
-            return
         round_no += 1
-        in_osds = {o['osd'] for o in osd_dump['osds'] if o['in']}
-        pgs = get_pg_info(cluster, logger, get_pg_dump(cluster))
-        pinned = pin_remapped_pgs(cluster, pgs, splitting, in_osds.__contains__, False, logger, failure_domains)
-        logger.info(f"Split round {round_no}: pinned {pinned} remapped PG(s) in place; "
-                    + "; ".join(split_progress(pool) for pool in splitting.values()))
+        try:
+            osd_dump = get_osd_dump(cluster)
+            splitting = splitting_pools(osd_dump)
+            if not splitting:
+                logger.info("No pool is splitting any more; planning the balance")
+                return
+            check_balancer_off(cluster)
+            in_osds = {o['osd'] for o in osd_dump['osds'] if o['in']}
+            pgs = get_pg_info(cluster, logger, get_pg_dump(cluster))
+            pinned = pin_remapped_pgs(cluster, pgs, splitting, in_osds.__contains__, False, logger,
+                                      failure_domains)
+            logger.info(f"Split round {round_no}: pinned {pinned} remapped PG(s) in place; "
+                        + "; ".join(split_progress(pool) for pool in splitting.values()))
+            failed = 0
+        except CephCommandError as e:
+            failed += 1
+            if failed >= MAX_FAILED_ROUNDS:
+                raise
+            logger.warning(f"Split round {round_no}: {e}; trying again next round ({failed}/{MAX_FAILED_ROUNDS})")
         sleep(interval)
 
 def print_split_holds(cluster_state, splitting, logger):

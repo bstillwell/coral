@@ -1232,16 +1232,27 @@ class FakeSteppingCluster:
         self.backfilling = set()
         self.weight = 1
         self.commands = []
+        self.flags = ""
+        self.balancer = False
+        self.fail_queries = 0       # fail this many osd dumps
 
     def up(self, pgid):
         return coral.apply_upmap_items(self.raw[pgid], self.upmaps[pgid], all_in)
+
+    def mgr_command(self, cmd_json, inbuf, timeout=5):
+        assert json.loads(cmd_json)["prefix"] == "balancer status"
+        return 0, json.dumps({"active": self.balancer, "mode": "upmap"}).encode(), ""
 
     def mon_command(self, cmd_json, inbuf, timeout=5):
         cmd = json.loads(cmd_json)
         prefix = cmd["prefix"]
         if prefix == "osd dump":
+            if self.fail_queries:
+                self.fail_queries -= 1
+                return -110, b"", "timed out"
             return 0, json.dumps({
                 "crush_version": 1,
+                "flags": self.flags,
                 "osds": [{"osd": o, "up": 1, "in": 1, "weight": self.weight} for o in range(12)],
                 "pools": [{"pool": 1, "pg_num": len(self.raw), "size": 3, "crush_rule": 0}],
                 "pg_upmap_items": [{"pgid": pgid, "mappings": [{"from": f, "to": t} for f, t in items]}
@@ -1295,6 +1306,38 @@ class TestRunUpmapPlan:
                                       failure_domains={1: rack}, pool_osds={1: list(rack)})
         assert result == "done" and fake.up("1.0") == [3, 4, 5]
         assert [sum(a != b for a, b in zip(before, after)) for _, before, after in fake.commands] == [1, 1, 1, 1]
+
+    def run(self, fake, plan, logger, sleep=lambda s: None):
+        fingerprint = coral.plan_fingerprint(json.loads(fake.mon_command('{"prefix": "osd dump"}', b"")[1]))
+        return coral.run_upmap_plan(fake, plan, fingerprint, 60, logger, sleep=sleep)
+
+    def test_waits_while_backfill_is_blocked(self, logger):
+        fake = FakeSteppingCluster({"1.0": [0, 1, 2]})
+        fake.flags = "norebalance"
+        def sleep(_):
+            if len(sleeps) == 1:
+                fake.flags = ""     # the operator unsets it
+            sleeps.append(_)
+        sleeps = []
+        assert self.run(fake, {"1.0": [6, 1, 2]}, logger, sleep) == "done"
+        assert len(fake.commands) == 1 and len(sleeps) >= 2
+
+    def test_stops_if_the_balancer_is_turned_on(self, logger):
+        fake = FakeSteppingCluster({"1.0": [0, 1, 2]})
+        fake.balancer = True
+        with pytest.raises(coral.PreflightError):
+            self.run(fake, {"1.0": [6, 1, 2]}, logger)
+        assert fake.commands == []
+
+    def test_retries_failed_queries(self, logger):
+        fake = FakeSteppingCluster({"1.0": [0, 1, 2]})
+        fingerprint = coral.plan_fingerprint(json.loads(fake.mon_command('{"prefix": "osd dump"}', b"")[1]))
+        fake.fail_queries = coral.MAX_FAILED_ROUNDS - 1
+        assert coral.run_upmap_plan(fake, {"1.0": [6, 1, 2]}, fingerprint, 60, logger,
+                                    sleep=lambda s: None) == "done"
+        fake.fail_queries = coral.MAX_FAILED_ROUNDS
+        with pytest.raises(coral.CephCommandError):
+            coral.run_upmap_plan(fake, {"1.0": [0, 1, 2]}, fingerprint, 60, logger, sleep=lambda s: None)
 
     def test_replans_when_the_cluster_changes(self, logger):
         fake = FakeSteppingCluster({"1.0": [0, 1, 2]})
@@ -1376,6 +1419,7 @@ class TestSplitHolds:
             return 0, b"", ""
         cluster = MagicMock()
         cluster.mon_command.side_effect = mon_command
+        cluster.mgr_command.return_value = (0, b'{"active": false}', "")
         sleeps = []
         coral.hold_splits(cluster, 30, logger, sleep=sleeps.append)
         assert sleeps == [30, 30]
@@ -1385,6 +1429,61 @@ class TestSplitHolds:
         coral.announce_splits({1: split_pool(1, pg_num=8, pg_num_target=16, pgp_num=8, pgp_num_target=16)})
         out = capsys.readouterr().out
         assert "pg_num 8/16, pgp_num 8/16" in out and "pins each remapped PG" in out
+
+
+class TestPreflight:
+    def cluster(self, balancer=(0, b'{"active": false, "mode": "upmap"}', "")):
+        cluster = MagicMock()
+        cluster.mgr_command.return_value = balancer
+        return cluster
+
+    def test_clean_cluster(self):
+        dump = {"flags": "sortbitwise,recovery_deletes", "require_min_compat_client": "luminous"}
+        assert coral.preflight_checks(self.cluster(), dump) == ([], [])
+
+    def test_balancer_on_is_an_error(self):
+        errors, _ = coral.preflight_checks(self.cluster((0, b'{"active": true}', "")), {})
+        assert errors == [coral.BALANCER_ON]
+
+    def test_unknown_balancer_state_is_a_warning(self):
+        for reply in ((-2, b"", "no mgr"), (0, b"not json", "")):
+            errors, warnings = coral.preflight_checks(self.cluster(reply), {})
+            assert errors == [] and "balancer" in warnings[0]
+
+    def test_pre_luminous_clients_are_an_error(self):
+        errors, _ = coral.preflight_checks(self.cluster(), {"require_min_compat_client": "jewel"})
+        assert "luminous" in errors[0]
+        assert coral.preflight_checks(self.cluster(), {"require_min_compat_client": "squid"}) == ([], [])
+
+    def test_flags_that_block_data_movement_are_warnings(self):
+        dump = {"flags": "noout,norebalance,sortbitwise", "flags_set": ["nobackfill", "norecover"]}
+        errors, warnings = coral.preflight_checks(self.cluster(), dump)
+        assert errors == []
+        assert [w.split()[1] for w in warnings] == ["nobackfill", "norebalance", "norecover"]
+
+    def test_apply_stops_before_changing_anything(self, logger, capsys):
+        from types import SimpleNamespace
+        args = SimpleNamespace(interval=60, preview_pgs=False)
+        cluster = make_mock_cluster({"osd dump": {**OSD_DUMP, "osds": [
+            {"osd": 0, "up": 1, "in": 1, "weight": 1.0}, {"osd": 1, "up": 1, "in": 1, "weight": 1.0}]}})
+        cluster.mgr_command.return_value = (0, b'{"active": true}', "")
+        with pytest.raises(coral.PreflightError):
+            coral.run_coral(cluster, args, False, False, logger)
+        prefixes = [json.loads(c.args[0])["prefix"] for c in cluster.mon_command.call_args_list]
+        assert prefixes == ["osd dump"]
+        assert "balancer" in capsys.readouterr().out
+        # a dry run still shows the plan after the error
+        coral.run_coral(cluster, args, False, True, logger)
+        assert "PG(s) to change" in capsys.readouterr().out
+
+    def test_failed_query_raises(self):
+        cluster = MagicMock()
+        cluster.mon_command.return_value = (-13, b"", "access denied")
+        with pytest.raises(coral.CephCommandError, match="osd dump.*access denied"):
+            coral.get_osd_dump(cluster)
+        cluster.mon_command.return_value = (0, b"<html>", "")
+        with pytest.raises(coral.CephCommandError, match="isn't JSON"):
+            coral.get_osd_dump(cluster)
 
 
 class TestPrintUpmapPlan:

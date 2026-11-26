@@ -57,14 +57,20 @@ PG splits are handled before any balancing. `splitting_pools()` finds pools whos
 
 Full OSDs are handled first. Utilization (`osd_utilization()`, `kb_used / kb` from `pg dump` `osd_stats`) is re-read every round; `next_upmap_step()` moves the shard off the fullest OSD first. In `apply_upmap_round()` a PG is *urgent* if its plan moves a shard off an OSD at or above `nearfull_ratio`; while any urgent PG can step or is progressing (backfilling / recovering or queued, not toofull), only urgent PGs and no-data-movement steps start, fullest first. Urgency is per PG, not per step, so an urgent PG whose next step has to move a different shard first still goes, and a stuck urgent PG doesn't stall the others. In planning, `fits_below_backfillfull()` (projected usage = raw `used` + `future_usage` − `current_usage`, or `future_usage` if `used` wasn't reported) gates every added move in `rebuild_upmaps()`, `balance_off_target_osds()` and `drain_to_at_ceil_osd()`, and `rebuild_upmaps()` restores dropped upmaps when sending their PGs back would put the source OSD past `backfillfull_ratio`.
 
+## Pre-flight checks
+
+`main()` connects and calls `run_coral()`, turning `CephCommandError` / `PreflightError` into an error message and exit status 1. `run_coral()` starts with `preflight_checks(cluster, osd_dump)` → `(errors, warnings)`, printed by `print_preflight()`. Errors (mgr balancer on, via `balancer_active()` / `mgr_command('balancer status')`; `require_min_compat_client` before luminous) raise `PreflightError` under `--apply`; a dry run continues. Warnings: `norebalance` / `nobackfill` (`BACKFILL_BLOCKING_FLAGS`, from `osd_flags()`), `norecover`, unknown balancer state. Each round of `run_upmap_plan()` and `hold_splits()` calls `check_balancer_off()`; `run_upmap_plan()` also starts nothing while a blocking flag is set. Both retry a round that raised `CephCommandError`, up to `MAX_FAILED_ROUNDS` in a row.
+
 ## RADOS Communication
 
-All Ceph queries and mutations use `cluster.mon_command()`:
+Ceph queries go through `mon_json(cluster, prefix, **args)`, which runs `cluster.mon_command()` and raises `CephCommandError` on a non-zero return code or output that isn't JSON:
 
 ```python
-cmd = {'prefix': 'osd dump', 'format': 'json'}
-ret, output, errs = cluster.mon_command(json.dumps(cmd), b'', timeout=5)
+osd_dump = mon_json(cluster, 'osd dump')
+crush_tree = mon_json(cluster, 'osd crush tree', shadow='--show-shadow')
 ```
+
+`send_upmap_items()` sends the upmap changes and checks the return code itself (a refused change is logged and skipped). The only mgr command is `balancer status`. The `timeout` argument to `mon_command` is ignored by current rados bindings.
 
 Dry-run mode (`print_upmap_plan()`) runs one `apply_upmap_round()` against the starting state with `is_dryrun=True`, which prints the equivalent `ceph` CLI commands instead of sending them, followed by a summary of the remaining PGs and shard moves.
 
