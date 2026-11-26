@@ -80,7 +80,7 @@ class TestGetOsdInfo:
         # osd.2 is in the OSD map (down/out) but was unlinked from CRUSH
         osd_dump = {**OSD_DUMP, "osds": OSD_DUMP["osds"] + [{"osd": 2, "up": 0, "in": 0}]}
         result = coral.get_osd_info(make_mock_cluster({"osd dump": osd_dump}), logger)
-        assert result[2] == {"up": 0, "in": 0, "crush_weight": 0.0, "size": 0, "device_class": ""}
+        assert result[2] == {"up": 0, "in": 0, "crush_weight": 0.0, "size": 0, "device_class": "", "crush_location": {}}
 
     def test_osd_in_crush_but_not_osd_map(self, logger):
         tree = {"nodes": CRUSH_TREE["nodes"] + [
@@ -1301,6 +1301,10 @@ class FakeSteppingCluster:
         self.flags = ""
         self.balancer = False
         self.fail_queries = 0       # fail this many osd dumps
+        self.config = []            # config dump
+        self.before = {}            # acting set of a PG while it backfills
+        self.pg_dumps = 0
+        self.command_rounds = []    # which pg dump each command followed
 
     def up(self, pgid):
         return coral.apply_upmap_items(self.raw[pgid], self.upmaps[pgid], all_in)
@@ -1329,16 +1333,21 @@ class FakeSteppingCluster:
             for pgid in self.raw:
                 busy = pgid in self.backfilling
                 stats.append({"pgid": pgid, "up": self.up(pgid),
-                              "acting": [] if busy else self.up(pgid),
+                              "acting": self.before[pgid] if busy else self.up(pgid),
                               "state": "active+remapped+backfilling" if busy else "active+clean",
                               "stat_sum": {"num_bytes": 1}})
             self.backfilling = set()   # everything finishes by the next round
+            self.pg_dumps += 1
             return 0, json.dumps({"pg_map": {"pg_stats": stats}}).encode(), ""
+        if prefix == "config dump":
+            return 0, json.dumps(self.config).encode(), ""
         if prefix in ("osd pg-upmap-items", "osd rm-pg-upmap-items"):
             ids = cmd.get("id", [])
             before = self.up(cmd["pgid"])
             self.upmaps[cmd["pgid"]] = list(zip(ids[::2], ids[1::2]))
             self.commands.append((cmd["pgid"], before, self.up(cmd["pgid"])))
+            self.command_rounds.append(self.pg_dumps)
+            self.before[cmd["pgid"]] = before
             self.backfilling.add(cmd["pgid"])
             return 0, b"", ""
         raise AssertionError(prefix)
@@ -1405,12 +1414,127 @@ class TestRunUpmapPlan:
         with pytest.raises(coral.CephCommandError):
             coral.run_upmap_plan(fake, {"1.0": [0, 1, 2]}, fingerprint, 60, logger, sleep=lambda s: None)
 
+    def test_starts_only_what_can_backfill_right_away(self, logger):
+        # Both PGs move a shard to OSD 6, which takes one backfill at a time:
+        # 1.1 waits for 1.0's backfill to finish instead of queueing behind it.
+        fake = FakeSteppingCluster({"1.0": [0, 1, 2], "1.1": [3, 4, 5]})
+        fake.config = [{"section": "osd", "name": "osd_op_queue", "value": "wpq", "mask": ""},
+                       {"section": "osd", "name": "osd_max_backfills", "value": "1", "mask": ""}]
+        fingerprint = coral.plan_fingerprint(json.loads(fake.mon_command('{"prefix": "osd dump"}', b"")[1]))
+        osds = {o: {"device_class": "hdd", "crush_location": {}} for o in range(12)}
+        assert coral.run_upmap_plan(fake, {"1.0": [6, 1, 2], "1.1": [3, 6, 5]}, fingerprint, 60, logger,
+                                    sleep=lambda s: None, osds=osds) == "done"
+        assert [c[0] for c in fake.commands] == ["1.0", "1.1"]
+        assert fake.command_rounds == [1, 3]    # round 2: 1.0 still backfilling onto 6
+        # --max-backfills 2 lets both go at once
+        fake = FakeSteppingCluster({"1.0": [0, 1, 2], "1.1": [3, 4, 5]})
+        coral.run_upmap_plan(fake, {"1.0": [6, 1, 2], "1.1": [3, 6, 5]}, fingerprint, 60, logger,
+                             sleep=lambda s: None, osds=osds, max_backfills=2)
+        assert fake.command_rounds == [1, 1]
+
     def test_replans_when_the_cluster_changes(self, logger):
         fake = FakeSteppingCluster({"1.0": [0, 1, 2]})
         fingerprint = coral.plan_fingerprint(json.loads(fake.mon_command('{"prefix": "osd dump"}', b"")[1]))
         fake.weight = 0.5   # someone reweighted an OSD
         assert coral.run_upmap_plan(fake, {"1.0": [6, 7, 8]}, fingerprint, 60, logger, sleep=lambda s: None) == "replan"
         assert fake.commands == []
+
+
+def config_entry(section, name, value, mask=""):
+    return {"section": section, "name": name, "value": str(value), "mask": mask}
+
+
+class TestBackfillSlots:
+    OSD = {"device_class": "hdd", "crush_location": {"host": "host0", "rack": "r1", "root": "default"}}
+
+    def test_crush_locations_skip_shadow_buckets(self):
+        tree = {"nodes": [
+            {"id": -1, "name": "default", "type": "root", "children": [-2]},
+            {"id": -2, "name": "host0", "type": "host", "children": [0]},
+            {"id": -3, "name": "default~hdd", "type": "root", "children": [-4]},
+            {"id": -4, "name": "host0~hdd", "type": "host", "children": [0]},
+            {"id": 0, "name": "osd.0", "type": "osd", "children": []},
+        ]}
+        assert coral.crush_locations(tree) == {0: {"host": "host0", "root": "default"}}
+
+    def test_config_precedence(self):
+        value = lambda config, osd_id=0: coral.osd_config_value(config, osd_id, self.OSD, "osd_max_backfills")
+        name = "osd_max_backfills"
+        assert value([]) is None
+        assert value([config_entry("global", name, 5)]) == "5"
+        assert value([config_entry("osd", name, 2), config_entry("global", name, 5)]) == "2"
+        assert value([config_entry("osd.0", name, 4), config_entry("osd", name, 2)]) == "4"
+        assert value([config_entry("osd.1", name, 4), config_entry("osd", name, 2)]) == "2"
+        assert value([config_entry("osd.*", name, 20)]) is None     # not a real section
+        # a matching mask beats no mask in the same section; others don't apply
+        assert value([config_entry("osd", name, 2), config_entry("osd", name, 3, "class:hdd")]) == "3"
+        assert value([config_entry("osd", name, 2), config_entry("osd", name, 3, "class:ssd")]) == "2"
+        assert value([config_entry("osd", name, 1, "root:archive"), config_entry("osd", name, 2)]) == "2"
+        assert value([config_entry("osd", name, 2), config_entry("osd", name, 6, "rack:r1/class:hdd"),
+                      config_entry("osd", name, 3, "host:host0")]) == "6"
+
+    def test_limits(self):
+        osds = {0: self.OSD}
+        wpq = config_entry("osd", "osd_op_queue", "wpq")
+        three = config_entry("osd", "osd_max_backfills", 3)
+        override = config_entry("osd", "osd_mclock_override_recovery_settings", "true")
+        assert coral.backfill_limits([], osds, "reef") == {0: 1}
+        assert coral.backfill_limits([wpq, three], osds, "reef") == {0: 3}
+        # mclock (quincy's default) holds it at 1 unless overridden
+        assert coral.backfill_limits([three], osds, "reef") == {0: 1}
+        assert coral.backfill_limits([three, override], osds, "reef") == {0: 3}
+        # before quincy the default queue is wpq
+        assert coral.backfill_limits([three], osds, "pacific") == {0: 3}
+
+    def test_reservations(self):
+        pgs = {
+            "1.0": stepping_pg([0, 1, 6], acting=[0, 1, 2], state="active+remapped+backfilling"),
+            "1.1": stepping_pg([3, 4, 6], acting=[3, 4, 5], state="active+remapped+backfill_wait"),
+            "1.2": stepping_pg([7, 8, 9], acting=[7, 8, 5], state="active+remapped+backfill_wait+backfill_toofull"),
+            "1.3": stepping_pg([0, 4, 7], state="active+recovering+degraded"),
+            "1.4": stepping_pg([1, 8, 9], acting=[1, 8, 2], state="peering"),
+            "1.5": stepping_pg([2, 3, 5]),
+        }
+        pgs["1.1"]["acting_primary"] = 4
+        local, remote = coral.backfill_reservations(pgs)
+        assert local == {0: 2, 4: 1, 1: 1}
+        assert remote == {6: 2, 4: 1, 7: 1, 9: 1}
+
+    def round(self, pgs, plan, max_backfills, **kwargs):
+        cluster = MagicMock()
+        cluster.mon_command.return_value = (0, b'', '')
+        result = coral.apply_upmap_round(cluster, plan, pgs, all_in, False, MagicMock(),
+                                         max_backfills=max_backfills, **kwargs)
+        sent = [json.loads(c.args[0]) for c in cluster.mon_command.call_args_list]
+        return result, sent
+
+    def test_round_starts_only_steps_with_free_slots(self):
+        pgs = {"1.0": stepping_pg([0, 1]), "1.1": stepping_pg([2, 3]),
+               "1.2": stepping_pg([4, 5]),
+               "1.3": stepping_pg([3, 7], acting=[3, 8], state="active+remapped+backfilling"),
+               "1.4": stepping_pg([4, 1], upmaps=[(9, 4), (6, 7)])}     # only drops a dead item
+        plan = {"1.0": [9, 1], "1.1": [2, 9], "1.2": [4, 6], "1.4": [4, 1]}
+        limits = {o: 1 for o in range(10)}
+        (started, remaining), sent = self.round(pgs, plan, limits)
+        # 1.1 needs OSD 9, which 1.0 just took; 1.2's primary is free and so
+        # is OSD 6; 1.4 moves no data
+        assert [c["pgid"] for c in sent] == ["1.0", "1.2", "1.4"]
+        assert (started, remaining) == (3, 4)
+        # a primary already busy with a backfill holds its PG back
+        (started, _), sent = self.round({"1.1": pgs["1.1"], "1.5": stepping_pg([7, 2], acting=[7, 8],
+                                         state="active+remapped+backfilling")}, {"1.1": [2, 9]}, limits)
+        assert started == 1
+        (started, _), sent = self.round({"1.1": pgs["1.1"], "1.5": stepping_pg([2, 9], acting=[2, 8],
+                                         state="active+remapped+backfilling")}, {"1.1": [2, 9]}, limits)
+        assert started == 0
+
+    def test_step_prefers_a_target_with_a_free_slot(self):
+        # OSD 6 is busy; the PG moves its other shard (to 7) first
+        pgs = {"1.0": stepping_pg([0, 1, 2]),
+               "1.1": stepping_pg([3, 6], acting=[3, 8], state="active+remapped+backfilling")}
+        (started, _), sent = self.round(pgs, {"1.0": [6, 7, 2]}, {o: 1 for o in range(10)},
+                                        utilization={0: 0.9})
+        assert started == 1 and sent[0]["id"] == [1, 7]
 
 
 def split_pool(pool_id=1, pg_num=8, pg_num_target=8, pgp_num=8, pgp_num_target=8, pool_type=1):
@@ -1563,6 +1687,12 @@ class TestPrintUpmapPlan:
         out = capsys.readouterr().out
         assert "ceph osd pg-upmap-items 1.0 0 3" in out
         assert "1 PG(s) to change (2 shard move(s) in total)" in out
+
+    def test_mentions_backfill_limits(self, logger, capsys):
+        state = make_state({0: (0, 0), 1: (1, 1), 2: (0, 1), 3: (1, 1)}, {"1.0": ([0, 1], [])})
+        state["pgs"]["1.0"]["state"] = ["active", "clean"]
+        coral.print_upmap_plan(state, {"1.0": [3, 2]}, 60, logger, {o: 1 for o in range(4)})
+        assert "Backfills per OSD (osd_max_backfills): 1 on 4 OSDs." in capsys.readouterr().out
 
 
 class TestDisplayUsage:

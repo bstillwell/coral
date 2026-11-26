@@ -87,6 +87,7 @@ def make_mock_cluster(overrides=None):
         "osd erasure-code-profile get": EC_PROFILE,
         "osd crush rule dump": CRUSH_RULE_DUMP,
         "osd crush tree": CRUSH_TREE,
+        "config dump": [],
     }
     if overrides:
         responses.update(overrides)

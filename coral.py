@@ -8,7 +8,7 @@ import math
 import rados
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 BLUE = '\033[0;34m'
 CYAN = '\033[0;36m'
@@ -38,6 +38,11 @@ def main():
                         help="Apply the upmap changes to the cluster, one shard per PG at a time: every --interval seconds, each PG that is active+clean and not yet at its target gets its next single-shard change. Runs until every PG is at its target. Without this flag, coral runs in dry-run mode and prints the first round of pg-upmap-items commands instead.")
     parser.add_argument('--interval', type=float, default=60,
                         help="Seconds between rounds when applying (default: 60)")
+    parser.add_argument('--max-backfills', type=int, metavar='N',
+                        help="Backfills each OSD takes part in at once, as a PG's primary and again as a target. "
+                             "coral only starts a change whose backfill can start right away. Default: each OSD's "
+                             "osd_max_backfills from the cluster's configuration database (1 under the mclock "
+                             "scheduler unless osd_mclock_override_recovery_settings is true)")
     parser.add_argument('--preview-pgs', action='store_true',
                         help="After the usage table, print a per-OSD breakdown of future PGs by pool with their target floor/ceil")
     args = parser.parse_args()
@@ -110,14 +115,18 @@ def run_coral(cluster, args, is_preview, is_dryrun, logger):
             if splitting:
                 print_split_holds(cluster_state, splitting, logger)
             else:
-                print_upmap_plan(cluster_state, plan, args.interval, logger)
+                limits = get_backfill_limits(cluster, osd_dump, cluster_state['osds'],
+                                             getattr(args, 'max_backfills', None))
+                print_upmap_plan(cluster_state, plan, args.interval, logger, limits)
         else:
             try:
                 # Step every PG toward its target one shard at a time,
                 # re-planning if the cluster changes underneath us
                 while run_upmap_plan(cluster, plan, fingerprint, args.interval, logger,
                                      failure_domains=pool_failure_domains(cluster_state),
-                                     pool_osds=pool_rule_osds(cluster_state)) == 'replan':
+                                     pool_osds=pool_rule_osds(cluster_state),
+                                     osds=cluster_state['osds'],
+                                     max_backfills=getattr(args, 'max_backfills', None)) == 'replan':
                     splitting = splitting_pools(get_osd_dump(cluster))
                     if splitting:
                         announce_splits(splitting)
@@ -309,6 +318,7 @@ def get_osd_info(cluster, logger, pg_dump=None):
     for node in crush_tree.get('nodes', []):
         if node.get('type') == 'osd':
             crush_osds[node['id']] = node
+    locations = crush_locations(crush_tree)
     for osd_id in set(osd_info) | set(crush_osds):
         info = osd_info.setdefault(osd_id, {'up': 0, 'in': 0})
         node = crush_osds.get(osd_id, {})
@@ -318,8 +328,30 @@ def get_osd_info(cluster, logger, pg_dump=None):
         if 'kb_used' in stats:
             info['used'] = stats['kb_used'] * 1024
         info['device_class'] = node.get('device_class', '')
+        info['crush_location'] = locations.get(osd_id, {})
 
     return osd_info
+
+def crush_locations(crush_tree):
+    """{osd: {bucket type: bucket name}} for every bucket above each OSD (host,
+    rack, root, ...), skipping the device-class shadow buckets ('host0~hdd')."""
+    real_nodes = {n['id']: n for n in crush_tree.get('nodes', []) if '~' not in n['name']}
+    parent_of = {}
+    for node in real_nodes.values():
+        for child_id in node.get('children', []):
+            parent_of[child_id] = node['id']
+    locations = {}
+    for node in real_nodes.values():
+        if node.get('type') != 'osd':
+            continue
+        location = {}
+        cur = node['id']
+        while cur in parent_of and parent_of[cur] in real_nodes:
+            cur = parent_of[cur]
+            parent = real_nodes[cur]
+            location.setdefault(parent.get('type'), parent['name'])
+        locations[node['id']] = location
+    return locations
 
 def get_pg_info(cluster, logger, pg_dump=None):
     logger.debug("Gathering info for PGs")
@@ -334,6 +366,7 @@ def get_pg_info(cluster, logger, pg_dump=None):
             'up': pg['up'].copy(),
             'acting': pg['acting'].copy(),
             'state': pg['state'].split('+'),
+            'acting_primary': pg.get('acting_primary'),
             'num_bytes': pg['stat_sum']['num_bytes'],
             'upmaps': []
         }
@@ -1300,11 +1333,12 @@ def failure_domain_conflicts(up, bucket_of):
     return len(buckets) - len(set(buckets))
 
 def next_upmap_step(raw, current_up, target_up, is_in, utilization=None, bucket_of=None, spares=None,
-                    spare_rank=None):
+                    spare_rank=None, can_start=None):
     """pg_upmap_items for the smallest step toward target_up, or None.
 
     Normally that moves exactly one shard, off the fullest OSD first (per
-    utilization, {osd: used fraction}). Every intermediate up set must keep
+    utilization, {osd: used fraction}), but first of all to an OSD where
+    can_start(osd) says the backfill can start right away. Every intermediate up set must keep
     the PG's failure domains distinct (bucket_of: osd -> bucket): if it doesn't,
     the mon's upmap check (OSDMap::check_pg_upmaps -> verify_upmap) cancels
     every upmap item of the PG, not just the new one.
@@ -1324,7 +1358,8 @@ def next_upmap_step(raw, current_up, target_up, is_in, utilization=None, bucket_
     utilization = utilization or {}
     allowed = failure_domain_conflicts(target_up, bucket_of) if bucket_of else 0
     differing = sorted((i for i in range(len(current_up)) if current_up[i] != target_up[i]),
-                       key=lambda i: (-utilization.get(current_up[i], 0), i))
+                       key=lambda i: (can_start is not None and not can_start(target_up[i]),
+                                      -utilization.get(current_up[i], 0), i))
 
     def items_if_valid(step_up):
         if len(set(step_up)) != len(step_up):
@@ -1393,6 +1428,109 @@ def is_pg_settled(pg):
 
 def get_osd_dump(cluster):
     return mon_json(cluster, 'osd dump')
+
+# Releases whose OSDs default to the wpq op queue; quincy and later default to mclock_scheduler
+PRE_QUINCY = PRE_LUMINOUS | {'luminous', 'mimic', 'nautilus', 'octopus', 'pacific'}
+
+DEFAULT_MAX_BACKFILLS = 1
+
+def osd_config_value(config_dump, osd_id, osd, name):
+    """An option's value for one OSD from 'config dump', or None if it isn't set there.
+
+    Like the mons' ConfigMap: an osd.N entry beats an osd one, which beats a
+    global one, and within a section an entry whose mask (CRUSH location like
+    host:foo, or class:hdd) matches the OSD beats a less specific one. Entries
+    whose mask doesn't match the OSD don't apply to it.
+    """
+    sections = {'global': 0, 'osd': 1, f'osd.{osd_id}': 2}
+    location = osd.get('crush_location', {})
+    best, best_rank = None, None
+    for entry in config_dump:
+        if entry.get('name') != name or entry.get('section') not in sections:
+            continue
+        parts = [p.partition(':') for p in entry.get('mask', '').split('/') if p]
+        if not all((osd.get('device_class') if kind == 'class' else location.get(kind)) == value
+                   for kind, _, value in parts):
+            continue
+        rank = (sections[entry['section']], len(parts))
+        if best_rank is None or rank >= best_rank:
+            best, best_rank = entry.get('value'), rank
+    return best
+
+def backfill_limits(config_dump, osds, release):
+    """{osd: how many backfills it takes part in at once} from 'config dump'.
+
+    Each OSD grants osd_max_backfills reservations as a PG's primary, and as
+    many again as a backfill target. Under the mclock scheduler (the default
+    osd_op_queue from quincy on) the OSD holds it at 1 unless
+    osd_mclock_override_recovery_settings is true. release is the osd map's
+    require_osd_release, which decides the default scheduler.
+    """
+    limits = {}
+    for osd_id, osd in osds.items():
+        def value(name):
+            return osd_config_value(config_dump, osd_id, osd, name)
+        queue = value('osd_op_queue') or ('wpq' if release in PRE_QUINCY else 'mclock_scheduler')
+        override = (value('osd_mclock_override_recovery_settings') or '').lower() in ('true', '1', 'yes')
+        if queue == 'mclock_scheduler' and not override:
+            limits[osd_id] = DEFAULT_MAX_BACKFILLS
+            continue
+        try:
+            limits[osd_id] = max(0, int(value('osd_max_backfills') or DEFAULT_MAX_BACKFILLS))
+        except ValueError:
+            limits[osd_id] = DEFAULT_MAX_BACKFILLS
+    return limits
+
+def get_backfill_limits(cluster, osd_dump, osds, override=None):
+    """{osd: backfill limit}: override for every OSD if given (--max-backfills),
+    else read from the cluster's configuration (see backfill_limits())."""
+    if override is not None:
+        return {osd_id: override for osd_id in osds}
+    return backfill_limits(mon_json(cluster, 'config dump'), osds, osd_dump.get('require_osd_release', ''))
+
+def describe_backfill_limits(limits):
+    """'3 on 10 OSDs, 1 on 2 OSDs'"""
+    counts = Counter(limits.values())
+    return ', '.join(f"{n} on {c} OSD{'s' if c != 1 else ''}" for n, c in sorted(counts.items(), reverse=True))
+
+def pg_primary(pg):
+    """The PG's acting primary: where its backfill runs from."""
+    primary = pg.get('acting_primary')
+    if primary is not None and primary >= 0:
+        return primary
+    return next((o for o in pg['acting'] if o != CRUSH_ITEM_NONE), None)
+
+def backfill_reservations(pgs):
+    """(local, remote): Counters of the backfill and recovery reservations each
+    OSD holds or has queued, as a PG's primary (local) and as one of its
+    targets (remote).
+
+    A PG that's backfilling, waiting to, or remapped and still peering counts
+    on its primary and on each OSD in its up set but not its acting set; one
+    that's recovering, or waiting to, counts on its primary and every other
+    OSD in it. Toofull PGs hold nothing while they wait to retry.
+    """
+    local, remote = Counter(), Counter()
+    for pg in pgs.values():
+        state = set(pg['state'])
+        if state & {'backfill_toofull', 'recovery_toofull'}:
+            continue
+        backfill = bool(state & {'backfilling', 'backfill_wait'}) or (
+            pg['up'] != pg['acting'] and 'clean' not in state)
+        recovery = bool(state & {'recovering', 'recovery_wait'})
+        if not (backfill or recovery):
+            continue
+        primary = pg_primary(pg)
+        if primary is None:
+            continue
+        local[primary] += 1
+        if recovery:
+            targets = set(pg['up']) | set(pg['acting'])
+        else:
+            targets = set(pg['up']) - set(pg['acting'])
+        for osd_id in targets - {primary, CRUSH_ITEM_NONE}:
+            remote[osd_id] += 1
+    return local, remote
 
 def plan_fingerprint(osd_dump):
     """Everything the plan depends on except upmaps, which coral itself changes."""
@@ -1483,8 +1621,9 @@ def send_upmap_items(cluster, pgid, items, is_dryrun, logger):
     return True
 
 def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger, utilization=None, nearfull_ratio=None,
-                      failure_domains=None, spare_osds=None):
-    """Start the next single-shard change on every settled PG not yet at its target.
+                      failure_domains=None, spare_osds=None, max_backfills=None):
+    """Start the next single-shard change on every settled PG not yet at its target
+    whose backfill can start right away.
 
     All of a PG's backfill flows through its primary, and the PG holds a backfill
     reservation on the primary and every target OSD until the whole PG is done.
@@ -1503,6 +1642,16 @@ def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger, utilization=
     intermediate step valid. spare_osds is {pool_id: [osd, ...]}, the up and
     in OSDs the pool's rule can use: when shards have to trade failure domains,
     one hops to the least loaded of these first (see next_upmap_step()).
+
+    max_backfills is {osd: backfill limit} (see backfill_limits()). With it, a
+    step that moves data starts only if its PG's primary and the OSD it moves
+    to both have a free backfill reservation, counting the ones that running
+    and queued backfill and recovery hold (backfill_reservations()) and the
+    ones this round's steps take. A PG that would only queue (backfill_wait)
+    waits instead, so its upmap items stay unchanged until it can move: then
+    the misplaced data is all moving, and a later plan can still change its
+    mind for free. Each PG prefers a step it can start (and a temporary home
+    with a free slot). Without max_backfills, every settled PG steps.
     Returns (changes started, PGs not yet at their target).
     """
     utilization = utilization or {}
@@ -1510,6 +1659,15 @@ def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger, utilization=
     spare_osds = spare_osds or {}
     hops = defaultdict(int)     # temporary homes picked this round, to spread them out
     spares_by_pool = {}
+    if max_backfills is not None:
+        local, remote = backfill_reservations(pgs)
+
+    def limit(osd_id):
+        return max_backfills.get(osd_id, DEFAULT_MAX_BACKFILLS)
+
+    def can_start(osd_id):
+        """Whether osd_id can take another backfill as a target now."""
+        return max_backfills is None or remote[osd_id] < limit(osd_id)
 
     def spares_for(pool_id, bucket_map):
         """{bucket: [osd, ...]} of the pool's spare OSDs that aren't nearfull."""
@@ -1522,7 +1680,7 @@ def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger, utilization=
         return spares_by_pool[pool_id]
 
     def spare_rank(osd_id):
-        return hops[osd_id], utilization.get(osd_id, 0), osd_id
+        return not can_start(osd_id), hops[osd_id], utilization.get(osd_id, 0), osd_id
 
     def is_nearfull(osd_id):
         return nearfull_ratio is not None and utilization.get(osd_id, 0) >= nearfull_ratio
@@ -1532,7 +1690,7 @@ def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger, utilization=
         return (bool(state & {'backfilling', 'backfill_wait', 'recovering', 'recovery_wait'})
                 and not state & {'backfill_toofull', 'recovery_toofull'})
 
-    steps = []          # (pgid, items, urgency: fullest nearfull OSD it's leaving, or 0)
+    steps = []          # (pgid, items, urgency: fullest nearfull OSD it's leaving or 0, moves data, pg, step_up)
     remaining = 0
     urgent_in_progress = False
     for pgid, target_up in plan.items():
@@ -1559,7 +1717,7 @@ def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger, utilization=
             bucket_map = failure_domains.get(pool_id)
             items = next_upmap_step(raw, pg['up'], target_up, is_in, utilization,
                                     bucket_map.get if bucket_map is not None else None,
-                                    spares_for(pool_id, bucket_map), spare_rank)
+                                    spares_for(pool_id, bucket_map), spare_rank, can_start)
             if items is None:
                 # No valid smaller step; make the whole move at once
                 logger.warning(f"No valid step for {pgid} from {pg['up']} to {target_up}; moving it in one change")
@@ -1571,10 +1729,8 @@ def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger, utilization=
         for osd_id in step_up:
             if osd_id not in target_up and osd_id not in pg['up']:
                 hops[osd_id] += 1
-                logger.info(f"{pgid}: moving a shard to osd.{osd_id} temporarily so its other shards "
-                            f"can trade failure domains one at a time")
         moves_data = step_up != pg['up']
-        steps.append((pgid, items, urgency, moves_data))
+        steps.append((pgid, items, urgency, moves_data, pg, step_up))
 
     if urgent_in_progress or any(s[2] for s in steps):
         go = [s for s in steps if s[2] or not s[3]]
@@ -1585,24 +1741,48 @@ def apply_upmap_round(cluster, plan, pgs, is_in, is_dryrun, logger, utilization=
     steps.sort(key=lambda s: s[2], reverse=True)
 
     started = 0
-    for pgid, items, _, _ in steps:
-        if send_upmap_items(cluster, pgid, items, is_dryrun, logger):
-            started += 1
+    waiting = 0
+    for pgid, items, _, moves_data, pg, step_up in steps:
+        primary = pg_primary(pg)
+        targets = [o for o in step_up if o not in pg['acting'] and o != CRUSH_ITEM_NONE]
+        if max_backfills is not None and moves_data:
+            if (primary is not None and local[primary] >= limit(primary)) or not all(map(can_start, targets)):
+                waiting += 1
+                continue
+        if not send_upmap_items(cluster, pgid, items, is_dryrun, logger):
+            continue
+        started += 1
+        if max_backfills is not None and moves_data:
+            if primary is not None:
+                local[primary] += 1
+            for osd_id in targets:
+                remote[osd_id] += 1
+        for osd_id in step_up:
+            if osd_id not in plan[pgid] and osd_id not in pg['up']:
+                logger.info(f"{pgid}: moving a shard to osd.{osd_id} temporarily so its other shards "
+                            f"can trade failure domains one at a time")
+    if waiting:
+        logger.info(f"{waiting} PG(s) ready to step are waiting for a free backfill slot "
+                    f"on their primary or target OSD (osd_max_backfills)")
     return started, remaining
 
 def run_upmap_plan(cluster, plan, fingerprint, interval, logger, sleep=time.sleep, failure_domains=None,
-                   pool_osds=None):
+                   pool_osds=None, osds=None, max_backfills=None):
     """Apply a plan one shard per PG per round, every interval seconds.
 
     Returns 'done' once every PG is at its target, or 'replan' if OSDs, weights,
     pools or the CRUSH map changed since the plan was made. pool_osds is
     {pool_id: OSDs its CRUSH rule can use}, the candidates for temporary hops.
+    With osds (cluster_state['osds']), each round reads every OSD's backfill
+    limit (get_backfill_limits(), or max_backfills for all of them) and only
+    starts steps whose backfill can start right away.
     Starts nothing while norebalance or nobackfill is set, raises
     PreflightError if the mgr balancer is turned on, and retries a round whose
     queries failed (CephCommandError after MAX_FAILED_ROUNDS in a row).
     """
     round_no = 0
     failed = 0
+    described = None
     while True:
         round_no += 1
         try:
@@ -1618,6 +1798,12 @@ def run_upmap_plan(cluster, plan, fingerprint, interval, logger, sleep=time.slee
             else:
                 in_osds = {o['osd'] for o in osd_dump['osds'] if o['in']}
                 up_in_osds = {o['osd'] for o in osd_dump['osds'] if o['in'] and o['up']}
+                limits = None
+                if osds is not None:
+                    limits = get_backfill_limits(cluster, osd_dump, osds, max_backfills)
+                    if describe_backfill_limits(limits) != described:
+                        described = describe_backfill_limits(limits)
+                        logger.info(f"Backfills per OSD (osd_max_backfills): {described}")
                 pg_dump = get_pg_dump(cluster)
                 pgs = get_pg_info(cluster, logger, pg_dump)
                 started, remaining = apply_upmap_round(
@@ -1626,7 +1812,8 @@ def run_upmap_plan(cluster, plan, fingerprint, interval, logger, sleep=time.slee
                     nearfull_ratio=osd_dump.get('nearfull_ratio', 0.85),
                     failure_domains=failure_domains,
                     spare_osds={pool_id: [o for o in osd_ids if o in up_in_osds]
-                                for pool_id, osd_ids in (pool_osds or {}).items()})
+                                for pool_id, osd_ids in (pool_osds or {}).items()},
+                    max_backfills=limits)
                 logger.info(f"Round {round_no}: started {started} single-shard change(s); "
                             f"{remaining} PG(s) not yet at their target")
                 if remaining == 0:
@@ -1751,8 +1938,9 @@ def print_split_holds(cluster_state, splitting, logger):
     print(f"# {pinned} remapped PG(s) to pin in place while the split runs. With --apply, coral "
           f"repeats this every round until no pool is splitting, then plans and applies the balance.")
 
-def print_upmap_plan(cluster_state, plan, interval, logger):
-    """Dry run: print the first round of commands and summarize the rest."""
+def print_upmap_plan(cluster_state, plan, interval, logger, max_backfills=None):
+    """Dry run: print the first round of commands and summarize the rest.
+    max_backfills is {osd: backfill limit}, as for apply_upmap_round()."""
     osds = cluster_state['osds']
     def is_in(osd_id):
         return osds.get(osd_id, {}).get('in', 0) != 0
@@ -1767,7 +1955,8 @@ def print_upmap_plan(cluster_state, plan, interval, logger):
                                            failure_domains=pool_failure_domains(cluster_state),
                                            spare_osds={pool_id: [o for o in osd_ids if osds.get(o, {}).get('up')
                                                                  and is_in(o)]
-                                                       for pool_id, osd_ids in pool_rule_osds(cluster_state).items()})
+                                                       for pool_id, osd_ids in pool_rule_osds(cluster_state).items()},
+                                           max_backfills=max_backfills)
     shard_moves = sum(
         sum(1 for a, b in zip(pgs[pgid]['up'], target_up) if a != b)
         for pgid, target_up in plan.items()
@@ -1778,6 +1967,10 @@ def print_upmap_plan(cluster_state, plan, interval, logger):
         print(f"# With --apply, coral starts each PG's next single-shard change once it's "
               f"active+clean again, checking every {interval:g}s. While any planned move "
               f"off a nearfull OSD remains, only those start.")
+        if max_backfills is not None:
+            print(f"# A change starts only when its backfill can start right away, counting the backfill "
+                  f"and recovery already running or queued. Backfills per OSD (osd_max_backfills): "
+                  f"{describe_backfill_limits(max_backfills)}.")
 
 def display_usage(cluster_state):
     osds = cluster_state['osds']
