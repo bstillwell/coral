@@ -49,10 +49,25 @@ def main():
     # Calculate future OSD usage based on the 'up' set
     calculate_usage(cluster_state, logger)
 
+    # Pools that are splitting PGs: hold their data in place until the split
+    # is done, then balance
+    splitting = splitting_pools(get_osd_dump(cluster))
+    if splitting:
+        announce_splits(splitting)
+        if not is_dryrun:
+            try:
+                cluster_state = wait_out_splits(cluster, cluster_state, args.interval, logger)
+            except KeyboardInterrupt:
+                logger.info("Interrupted while holding splits in place. Re-run to continue.")
+                cluster.shutdown()
+                return
+            splitting = {}
+
     # In preview mode, skip the rebalancing computation entirely so the
     # displayed current/future state reflects only what the cluster will do on
-    # its own from existing PG up/acting sets.
-    if not is_preview:
+    # its own from existing PG up/acting sets. While a pool is splitting, the
+    # dry run shows the pins instead of a balance plan.
+    if not is_preview and not splitting:
         # Work out the target placement for every PG
         plan, fingerprint = plan_upmaps(cluster, cluster_state, logger)
 
@@ -64,7 +79,10 @@ def main():
 
     if not is_preview:
         if is_dryrun:
-            print_upmap_plan(cluster_state, plan, args.interval, logger)
+            if splitting:
+                print_split_holds(cluster_state, splitting, logger)
+            else:
+                print_upmap_plan(cluster_state, plan, args.interval, logger)
         else:
             try:
                 # Step every PG toward its target one shard at a time,
@@ -72,8 +90,13 @@ def main():
                 while run_upmap_plan(cluster, plan, fingerprint, args.interval, logger,
                                      failure_domains=pool_failure_domains(cluster_state),
                                      pool_osds=pool_rule_osds(cluster_state)) == 'replan':
-                    cluster_state = get_cluster_state(cluster, logger)
-                    calculate_usage(cluster_state, logger)
+                    splitting = splitting_pools(get_osd_dump(cluster))
+                    if splitting:
+                        announce_splits(splitting)
+                        cluster_state = wait_out_splits(cluster, cluster_state, args.interval, logger)
+                    else:
+                        cluster_state = get_cluster_state(cluster, logger)
+                        calculate_usage(cluster_state, logger)
                     plan, fingerprint = plan_upmaps(cluster, cluster_state, logger)
             except KeyboardInterrupt:
                 logger.info("Interrupted; stopping between rounds. Re-run to continue.")
@@ -81,6 +104,14 @@ def main():
     # Disconnect from the cluster
     logger.debug("Disconnecting from Ceph cluster")
     cluster.shutdown()
+
+def wait_out_splits(cluster, cluster_state, interval, logger):
+    """Hold splitting pools' data in place until no pool is splitting, then
+    return a fresh cluster state to plan the balance from."""
+    hold_splits(cluster, interval, logger, failure_domains=pool_failure_domains(cluster_state))
+    cluster_state = get_cluster_state(cluster, logger)
+    calculate_usage(cluster_state, logger)
+    return cluster_state
 
 def setup_logging(log_file, is_preview=False):
     logger = logging.getLogger('Coral')
@@ -1390,6 +1421,106 @@ def run_upmap_plan(cluster, plan, fingerprint, interval, logger, sleep=time.slee
             logger.info("Every PG is at its target placement")
             return 'done'
         sleep(interval)
+
+def splitting_pools(osd_dump):
+    """{pool_id: pool} from osd dump for pools whose PG count is growing.
+
+    The mgr raises pg_num toward pg_num_target, then pgp_num (pg_placement_num)
+    toward its target in steps. Each pgp_num step sends child PGs to their own
+    CRUSH placement, and the mgr takes the next step only while the cluster's
+    misplaced ratio is below target_max_misplaced_ratio. Merges (targets below
+    the current values) don't count: they need the PGs to move together.
+    """
+    pools = {}
+    for pool in osd_dump['pools']:
+        pg_num = pool['pg_num']
+        pgp_num = pool.get('pg_placement_num', pg_num)
+        if (pool.get('pg_num_target', pg_num) > pg_num
+                or pool.get('pg_placement_num_target', pgp_num) > pgp_num):
+            pools[pool['pool']] = pool
+    return pools
+
+def split_progress(pool):
+    pg_num = pool['pg_num']
+    pgp_num = pool.get('pg_placement_num', pg_num)
+    return (f"pool '{pool['pool_name']}' ({pool['pool']}): pg_num {pg_num}/{pool.get('pg_num_target', pg_num)}, "
+            f"pgp_num {pgp_num}/{pool.get('pg_placement_num_target', pgp_num)}")
+
+def announce_splits(splitting):
+    """Tell the user (on stdout, even with --preview) that coral holds split data in place."""
+    print(f"{YELLOW}NOTE: {len(splitting)} pool(s) are splitting PGs:{RESET}")
+    for pool in splitting.values():
+        print(f"{YELLOW}  {split_progress(pool)}{RESET}")
+    print(f"{YELLOW}With --apply, coral pins each remapped PG in these pools to the OSDs that hold its data now (like "
+          f"upmap-remapped), so nothing is misplaced and the mgr can keep raising pgp_num until the split "
+          f"is done. Balancing starts after that, and moves the data to its final place one shard at a time. "
+          f"The mgr waits whenever more than target_max_misplaced_ratio of the cluster's data is misplaced, "
+          f"so other backfill slows the split.{RESET}")
+
+def pin_items(pg, is_replicated, is_in, bucket_of=None):
+    """pg_upmap_items that make a remapped PG's up set match its acting set, or None.
+
+    The data then stays where it is instead of backfilling. For a replicated
+    pool only membership matters, so OSDs in both sets keep their up-set slot.
+    """
+    up, acting = pg['up'], pg['acting']
+    if (up == acting or len(up) != len(acting) or CRUSH_ITEM_NONE in acting
+            or 'active' not in pg['state'] or not all(is_in(o) for o in acting)):
+        return None
+    raw = unapply_upmap_items(up, pg['upmaps'], is_in)
+    if bucket_of and failure_domain_conflicts(acting, bucket_of) > failure_domain_conflicts(raw, bucket_of):
+        return None     # the mon would cancel every item of the PG
+    targets = [align_replicas(up, acting), list(acting)] if is_replicated else [list(acting)]
+    for target in targets:
+        items = items_for_up(raw, target, is_in)
+        if items is not None:
+            if sorted(items) == sorted(pg['upmaps']):
+                return None     # already pinned; waiting for the PG to re-peer
+            return items
+    return None
+
+def pin_remapped_pgs(cluster, pgs, splitting, is_in, is_dryrun, logger, failure_domains=None):
+    """Pin every remapped PG of the splitting pools in place. Returns how many were pinned."""
+    failure_domains = failure_domains or {}
+    pinned = 0
+    for pgid, pg in pgs.items():
+        pool_id = int(pgid.split('.')[0])
+        if pool_id not in splitting:
+            continue
+        bucket_map = failure_domains.get(pool_id)
+        items = pin_items(pg, splitting[pool_id]['type'] == 1, is_in,
+                          bucket_map.get if bucket_map is not None else None)
+        if items is not None and send_upmap_items(cluster, pgid, items, is_dryrun, logger):
+            pinned += 1
+    return pinned
+
+def hold_splits(cluster, interval, logger, failure_domains=None, sleep=time.sleep):
+    """While any pool is splitting, pin its remapped PGs in place every interval
+    seconds. Returns once no pool is splitting."""
+    round_no = 0
+    while True:
+        osd_dump = get_osd_dump(cluster)
+        splitting = splitting_pools(osd_dump)
+        if not splitting:
+            logger.info("No pool is splitting any more; planning the balance")
+            return
+        round_no += 1
+        in_osds = {o['osd'] for o in osd_dump['osds'] if o['in']}
+        pgs = get_pg_info(cluster, logger, get_pg_dump(cluster))
+        pinned = pin_remapped_pgs(cluster, pgs, splitting, in_osds.__contains__, False, logger, failure_domains)
+        logger.info(f"Split round {round_no}: pinned {pinned} remapped PG(s) in place; "
+                    + "; ".join(split_progress(pool) for pool in splitting.values()))
+        sleep(interval)
+
+def print_split_holds(cluster_state, splitting, logger):
+    """Dry run while pools are splitting: print the pins coral would set now."""
+    osds = cluster_state['osds']
+    def is_in(osd_id):
+        return osds.get(osd_id, {}).get('in', 0) != 0
+    pinned = pin_remapped_pgs(None, cluster_state['pgs'], splitting, is_in, True, logger,
+                              pool_failure_domains(cluster_state))
+    print(f"# {pinned} remapped PG(s) to pin in place while the split runs. With --apply, coral "
+          f"repeats this every round until no pool is splitting, then plans and applies the balance.")
 
 def print_upmap_plan(cluster_state, plan, interval, logger):
     """Dry run: print the first round of commands and summarize the rest."""

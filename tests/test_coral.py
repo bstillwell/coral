@@ -1304,6 +1304,89 @@ class TestRunUpmapPlan:
         assert fake.commands == []
 
 
+def split_pool(pool_id=1, pg_num=8, pg_num_target=8, pgp_num=8, pgp_num_target=8, pool_type=1):
+    return {"pool": pool_id, "pool_name": f"pool{pool_id}", "type": pool_type, "size": 3, "crush_rule": 0,
+            "pg_num": pg_num, "pg_num_target": pg_num_target,
+            "pg_placement_num": pgp_num, "pg_placement_num_target": pgp_num_target}
+
+
+class TestSplitHolds:
+    def test_splitting_pools(self):
+        dump = {"pools": [
+            split_pool(1, pg_num=8, pg_num_target=16, pgp_num=8, pgp_num_target=16),     # splitting
+            split_pool(2, pg_num=16, pg_num_target=16, pgp_num=10, pgp_num_target=16),   # pgp catching up
+            split_pool(3, pg_num=16, pg_num_target=8, pgp_num=8, pgp_num_target=8),      # merging
+            split_pool(4, pg_num=16, pg_num_target=16, pgp_num=8, pgp_num_target=8),     # pgp held low on purpose
+            split_pool(5),
+        ]}
+        assert set(coral.splitting_pools(dump)) == {1, 2}
+
+    def test_pin_matches_acting(self):
+        pg = stepping_pg([3, 4, 5], acting=[0, 1, 2], state="active+remapped+backfilling")
+        items = coral.pin_items(pg, False, all_in)
+        assert coral.apply_upmap_items([3, 4, 5], items, all_in) == [0, 1, 2]
+
+    def test_replicated_pin_keeps_shared_members_in_place(self):
+        # OSD 0 is in both sets; only 4 and 5 need mapping back
+        pg = stepping_pg([0, 4, 5], acting=[1, 0, 2], state="active+remapped+backfill_wait")
+        assert coral.pin_items(pg, True, all_in) == [(4, 1), (5, 2)]
+
+    def test_pin_accounts_for_existing_items(self):
+        # raw [0, 1, 6]; an item sends 6 -> 7, while the data is still on 6 and 1 -> 8 is new
+        pg = stepping_pg([0, 8, 7], acting=[0, 1, 6], upmaps=[(1, 8), (6, 7)], state="active+remapped+backfilling")
+        assert coral.pin_items(pg, False, all_in) == []     # i.e. remove the PG's items
+
+    def test_pin_skips(self):
+        remapped = "active+remapped+backfilling"
+        assert coral.pin_items(stepping_pg([0, 1, 2]), True, all_in) is None                       # not remapped
+        assert coral.pin_items(stepping_pg([0, 1, 2], acting=[0, 1, coral.CRUSH_ITEM_NONE], state=remapped),
+                               False, all_in) is None                                              # degraded
+        assert coral.pin_items(stepping_pg([0, 1, 2], acting=[0, 1, 3], state="peering"), True, all_in) is None
+        assert coral.pin_items(stepping_pg([0, 1, 2], acting=[1, 0, 2], state=remapped),
+                               False, all_in) is None                                              # EC swap
+        assert coral.pin_items(stepping_pg([0, 1, 3], acting=[0, 1, 2], upmaps=[(2, 3)], state=remapped),
+                               True, lambda o: o != 2) is None                                     # acting OSD out
+        assert coral.pin_items(stepping_pg([0, 2, 3], acting=[0, 1, 3], state=remapped), True, all_in,
+                               bucket_of={0: "A", 1: "A", 2: "B", 3: "C"}.get) is None             # mon would cancel
+
+    def test_pins_only_splitting_pools(self, logger):
+        cluster = MagicMock()
+        cluster.mon_command.return_value = (0, b'', '')
+        pgs = {"1.0": stepping_pg([3, 4, 5], acting=[0, 1, 2], state="active+remapped+backfilling"),
+               "2.0": stepping_pg([3, 4, 5], acting=[0, 1, 2], state="active+remapped+backfilling")}
+        assert coral.pin_remapped_pgs(cluster, pgs, {1: split_pool(1)}, all_in, False, logger) == 1
+        assert json.loads(cluster.mon_command.call_args.args[0])["pgid"] == "1.0"
+
+    def test_holds_until_the_split_finishes(self, logger):
+        dumps = [split_pool(1, pg_num=8, pg_num_target=16, pgp_num=8, pgp_num_target=16),
+                 split_pool(1, pg_num=16, pg_num_target=16, pgp_num=12, pgp_num_target=16),
+                 split_pool(1, pg_num=16, pg_num_target=16, pgp_num=16, pgp_num_target=16)]
+        sent = []
+        def mon_command(cmd_json, inbuf, timeout=5):
+            cmd = json.loads(cmd_json)
+            if cmd["prefix"] == "osd dump":
+                pool = dumps[0] if len(sleeps) == 0 else dumps[min(len(sleeps), 2)]
+                return 0, json.dumps({"pools": [pool], "pg_upmap_items": [],
+                                      "osds": [{"osd": o, "up": 1, "in": 1} for o in range(6)]}).encode(), ""
+            if cmd["prefix"] == "pg dump":
+                return 0, json.dumps({"pg_map": {"pg_stats": [
+                    {"pgid": "1.0", "up": [3, 4, 5], "acting": [0, 1, 2], "state": "active+remapped+backfilling",
+                     "stat_sum": {"num_bytes": 1}}]}}).encode(), ""
+            sent.append(cmd)
+            return 0, b"", ""
+        cluster = MagicMock()
+        cluster.mon_command.side_effect = mon_command
+        sleeps = []
+        coral.hold_splits(cluster, 30, logger, sleep=sleeps.append)
+        assert sleeps == [30, 30]
+        assert [c["pgid"] for c in sent] == ["1.0", "1.0"]
+
+    def test_announce_tells_the_user(self, capsys):
+        coral.announce_splits({1: split_pool(1, pg_num=8, pg_num_target=16, pgp_num=8, pgp_num_target=16)})
+        out = capsys.readouterr().out
+        assert "pg_num 8/16, pgp_num 8/16" in out and "pins each remapped PG" in out
+
+
 class TestPrintUpmapPlan:
     def test_prints_first_round_and_summary(self, logger, capsys):
         state = make_state({0: (0, 0), 1: (1, 1), 2: (0, 1), 3: (1, 1)},
