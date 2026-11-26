@@ -935,10 +935,41 @@ def queue_upmap_mapping_addition(cluster_state, pgid, mapping, logger):
         cluster_state['osds'][to_osd]['future_pgs_by_pool'].get(pool_id, 0) + 1
     cluster_state['upmap_queue'][pgid] = cluster_state['pgs'][pgid]['upmaps']
 
+# Byte balancing (see balance_off_target_osds): only move a shard between two
+# OSDs that are both within their PG-count range if their projected
+# utilization differs by at least this much, and the shard is at least this
+# big a share of the receiving OSD's size. Smaller differences aren't worth a
+# shard of backfill each.
+BYTE_BALANCE_MIN_GAP = 0.01
+BYTE_BALANCE_MIN_SHARD = 0.001
+
+def pool_shard_bytes(cluster_state):
+    """{pool_id: average bytes per shard}, the granularity a pool balances bytes at."""
+    total = defaultdict(int)
+    for pgid, pg in cluster_state['pgs'].items():
+        total[int(pgid.split('.')[0])] += pg['num_bytes']
+    sizes = {}
+    for pool_id, pool in cluster_state['pools'].items():
+        per_shard = pool.get('k', 1) if pool['type'] == 'erasure' else 1
+        sizes[pool_id] = total[pool_id] / max(pool['pgs'], 1) / per_shard
+    return sizes
+
 def balance_off_target_osds(cluster_state, logger):
+    """Queue new upmaps so every OSD's PG count is within its per-pool range,
+    then use the slack in those ranges to even out bytes.
+
+    Pools go largest shards first. Each pool's range is only floor..floor+1
+    PGs per OSD, and which OSDs end up with the extra one is free to choose:
+    give it to the OSDs that are emptiest in bytes so far (projected
+    utilization), so the smaller pools fill in around the larger ones. Ties in
+    the count pass are broken that way; then a byte pass moves shards from
+    fuller to emptier OSDs while both stay within their range (see
+    BYTE_BALANCE_MIN_GAP).
+    """
     logger.debug("Adding upmap mappings to pull off-target OSDs into their per-pool range")
 
     osds = cluster_state['osds']
+    shard_sizes = pool_shard_bytes(cluster_state)
 
     def count(osd_id, pool_id):
         return osds[osd_id]['future_pgs_by_pool'].get(pool_id, 0)
@@ -946,7 +977,11 @@ def balance_off_target_osds(cluster_state, logger):
     def target(osd_id, pool_id):
         return osds[osd_id]['target_pgs_by_pool'].get(pool_id, (0, 0))
 
-    for pool_id, pool in cluster_state['pools'].items():
+    def utilization(osd_id):
+        size = osds[osd_id].get('size')
+        return projected_usage(cluster_state, osd_id) / size if size else None
+
+    for pool_id, pool in sorted(cluster_state['pools'].items(), key=lambda p: (-shard_sizes[p[0]], p[0])):
         rule = cluster_state['crush_rules'][pool['crush_rule']]
         failure_domain = get_rule_failure_domain(rule)
         valid_osds = set(rule['valid_osds'])
@@ -978,113 +1013,121 @@ def balance_off_target_osds(cluster_state, logger):
             pos = pg['up'].index(from_osd)
             return (original_up[pos],) if pos < len(original_up) else ()
 
+        def move_one(from_osd, dests, relayed=False, accept=None):
+            """Move one of from_osd's PGs to the first valid OSD in dests (best
+            first). accept(pgid, to_osd), if given, must also agree. Returns
+            whether a move was queued."""
+            dest_rank = {osd_id: i for i, osd_id in enumerate(dests)}
+            # Recipients grouped by failure domain: when a PG already
+            # spans most domains (e.g. 11 EC shards over 12 racks), only
+            # the few recipients in its free domains need checking.
+            dests_by_bucket = defaultdict(list)
+            for osd_id in dests:
+                dests_by_bucket[bucket_map.get(osd_id)].append(osd_id)
+            donor_pgs = sorted(osd_pgs[from_osd])
+            # Cheap pre-checks for would_mix_roles(), which rejects most
+            # candidates on clusters with many upmaps. Without a chain to
+            # collapse, a move off an OSD that already receives in this
+            # pool, or onto one that already gives, always mixes roles.
+            roles = get_upmap_roles(cluster_state)
+            donor_receives = roles.get((pool_id, from_osd), (0, 0))[0] > 0
+
+            def gives_in_pool(osd_id):
+                return roles.get((pool_id, osd_id), (0, 0))[1] > 0
+
+            # Moves that cost no data movement first, then any valid move
+            for free_only in ((True, False) if prefer_free else (False,)):
+                for i in donor_pgs:
+                    pgid, pg = pool_pgs[i]
+                    if from_osd not in pg['up']:
+                        continue
+                    # The item (if any) that redirected this PG onto from_osd:
+                    # moving on from there collapses the chain
+                    chained_from = next((f for f, t in pg['upmaps'] if t == from_osd), None)
+                    if not relayed and donor_receives and chained_from is None:
+                        continue
+                    peer_buckets = {
+                        bucket_map.get(o) for o in pg['up']
+                        if o != from_osd and o != CRUSH_ITEM_NONE
+                    }
+                    if free_only:
+                        candidates = sorted((o for o in free_targets(pg, from_osd) if o in dest_rank),
+                                            key=dest_rank.get)
+                    else:
+                        allowed = [dests_by_bucket[b] for b in dests_by_bucket if b not in peer_buckets]
+                        if sum(len(group) for group in allowed) * 4 < len(dests):
+                            candidates = sorted((o for group in allowed for o in group), key=dest_rank.get)
+                        else:
+                            candidates = dests
+                    for to_osd in candidates:
+                        if to_osd in pg['up']:
+                            continue
+                        if bucket_map.get(to_osd) in peer_buckets:
+                            continue
+                        if not relayed and to_osd != chained_from and gives_in_pool(to_osd):
+                            continue
+                        if not fits_below_backfillfull(cluster_state, to_osd, pgid):
+                            continue
+                        if accept is not None and not accept(pgid, to_osd):
+                            continue
+                        if not relayed and would_mix_roles(cluster_state, pgid, (from_osd, to_osd)):
+                            continue
+                        logger.info(
+                            f"Adding balancing upmap {pgid}: ({from_osd} -> {to_osd}) "
+                            f"[pool={pool_id}]"
+                        )
+                        queue_upmap_mapping_addition(cluster_state, pgid, (from_osd, to_osd), logger)
+                        osd_pgs[from_osd].discard(i)
+                        osd_pgs[to_osd].add(i)
+                        return True
+            return False
+
         while True:
+            utils = {o: utilization(o) for o in valid_osds}
             # Donors: OSDs whose count is strictly above their floor, so
-            # donating one PG keeps them within range. Over-ceil OSDs naturally
-            # sort first because their excess above floor is largest.
+            # donating one PG keeps them within range. Over-ceil OSDs sort
+            # first (largest excess above floor), then the fullest in bytes.
             donors = []
             for osd_id in valid_osds:
                 floor = target(osd_id, pool_id)[0]
                 if count(osd_id, pool_id) > floor:
-                    donors.append((count(osd_id, pool_id) - floor, osd_id))
+                    u = utils[osd_id]
+                    donors.append((floor - count(osd_id, pool_id), -u if u is not None else 0, osd_id))
             if not donors:
                 break
-            donors.sort(reverse=True)
+            donors.sort()
 
             # Recipients: OSDs whose count is strictly below their ceil, so
             # receiving one PG keeps them within range. Under-floor OSDs (the
-            # largest room below ceil) naturally sort first.
+            # largest room below ceil) sort first, then the emptiest in bytes:
+            # that's who gets this pool's extra PGs.
             recipients = []
             for osd_id in valid_osds:
                 ceil = target(osd_id, pool_id)[1]
                 if count(osd_id, pool_id) < ceil:
-                    recipients.append((ceil - count(osd_id, pool_id), osd_id))
-            recipients.sort(reverse=True)
-            destinations = [osd_id for _, osd_id in recipients]
+                    u = utils[osd_id]
+                    recipients.append((count(osd_id, pool_id) - ceil, u if u is not None else 2.0, osd_id))
+            recipients.sort()
+            destinations = [osd_id for _, _, osd_id in recipients]
             under_floor = [o for o in destinations if count(o, pool_id) < target(o, pool_id)[0]]
 
             made_move = False
-            for _, from_osd in donors:
+            for _, _, from_osd in donors:
                 donor_is_over = count(from_osd, pool_id) > target(from_osd, pool_id)[1]
                 # Only commit a move that actually fixes an imbalance. If the
                 # donor isn't over-ceil, the recipient must be under-floor;
                 # otherwise both endpoints are already in range and moving a
-                # PG between them just churns upmaps.
+                # PG between them is left to the byte pass below.
                 dests = destinations if donor_is_over else under_floor
                 if not dests:
                     continue
-                dest_rank = {osd_id: i for i, osd_id in enumerate(dests)}
-                # Recipients grouped by failure domain: when a PG already
-                # spans most domains (e.g. 11 EC shards over 12 racks), only
-                # the few recipients in its free domains need checking.
-                dests_by_bucket = defaultdict(list)
-                for osd_id in dests:
-                    dests_by_bucket[bucket_map.get(osd_id)].append(osd_id)
                 # An OSD that drain_to_at_ceil_osd() relayed a PG through may
                 # pass a PG on while over its ceil, even though it now has
                 # upmaps both onto and off it — that second hop is what
                 # finishes the drain.
                 relayed = donor_is_over and (pool_id, from_osd) in cluster_state.get('drain_relays', ())
-                donor_pgs = sorted(osd_pgs[from_osd])
-                # Cheap pre-checks for would_mix_roles(), which rejects most
-                # candidates on clusters with many upmaps. Without a chain to
-                # collapse, a move off an OSD that already receives in this
-                # pool, or onto one that already gives, always mixes roles.
-                roles = get_upmap_roles(cluster_state)
-                donor_receives = roles.get((pool_id, from_osd), (0, 0))[0] > 0
-
-                def gives_in_pool(osd_id):
-                    return roles.get((pool_id, osd_id), (0, 0))[1] > 0
-
-                # Moves that cost no data movement first, then any valid move
-                for free_only in ((True, False) if prefer_free else (False,)):
-                    for i in donor_pgs:
-                        pgid, pg = pool_pgs[i]
-                        if from_osd not in pg['up']:
-                            continue
-                        # The item (if any) that redirected this PG onto from_osd:
-                        # moving on from there collapses the chain
-                        chained_from = next((f for f, t in pg['upmaps'] if t == from_osd), None)
-                        if not relayed and donor_receives and chained_from is None:
-                            continue
-                        peer_buckets = {
-                            bucket_map.get(o) for o in pg['up']
-                            if o != from_osd and o != CRUSH_ITEM_NONE
-                        }
-                        if free_only:
-                            candidates = sorted((o for o in free_targets(pg, from_osd) if o in dest_rank),
-                                                key=dest_rank.get)
-                        else:
-                            allowed = [dests_by_bucket[b] for b in dests_by_bucket if b not in peer_buckets]
-                            if sum(len(group) for group in allowed) * 4 < len(dests):
-                                candidates = sorted((o for group in allowed for o in group), key=dest_rank.get)
-                            else:
-                                candidates = dests
-                        for to_osd in candidates:
-                            if to_osd in pg['up']:
-                                continue
-                            if bucket_map.get(to_osd) in peer_buckets:
-                                continue
-                            if not relayed and to_osd != chained_from and gives_in_pool(to_osd):
-                                continue
-                            if not fits_below_backfillfull(cluster_state, to_osd, pgid):
-                                continue
-                            if not relayed and would_mix_roles(cluster_state, pgid, (from_osd, to_osd)):
-                                continue
-                            logger.info(
-                                f"Adding balancing upmap {pgid}: ({from_osd} -> {to_osd}) "
-                                f"[pool={pool_id}]"
-                            )
-                            queue_upmap_mapping_addition(cluster_state, pgid, (from_osd, to_osd), logger)
-                            osd_pgs[from_osd].discard(i)
-                            osd_pgs[to_osd].add(i)
-                            made_move = True
-                            break
-                        if made_move:
-                            break
-                    if made_move:
-                        break
-                if made_move:
+                if move_one(from_osd, dests, relayed):
+                    made_move = True
                     break
 
             if not made_move:
@@ -1094,6 +1137,44 @@ def balance_off_target_osds(cluster_state, logger):
 
             if not made_move:
                 break
+
+        balance_pool_bytes(cluster_state, pool_id, valid_osds, count, target, utilization, move_one)
+
+def balance_pool_bytes(cluster_state, pool_id, valid_osds, count, target, utilization, move_one):
+    """Byte pass for one pool whose PG counts are in range: move shards from
+    the fullest OSDs (above floor) to the emptiest (below ceil), keeping both
+    within range. A move needs the two OSDs' projected utilization to differ by
+    at least BYTE_BALANCE_MIN_GAP, a shard of at least BYTE_BALANCE_MIN_SHARD
+    of the receiver's size, and must not leave the receiver fuller than the
+    donor, so every move narrows the spread and the pass can't oscillate."""
+    osds = cluster_state['osds']
+
+    def accept_from(from_osd):
+        def accept(pgid, to_osd):
+            moving = shard_bytes(cluster_state, pgid)
+            from_size, to_size = osds[from_osd]['size'], osds[to_osd]['size']
+            if moving < BYTE_BALANCE_MIN_SHARD * to_size:
+                return False
+            return ((projected_usage(cluster_state, from_osd) - moving) / from_size
+                    >= (projected_usage(cluster_state, to_osd) + moving) / to_size)
+        return accept
+
+    while True:
+        utils = {o: u for o in valid_osds if (u := utilization(o)) is not None and target(o, pool_id)[1] > 0}
+        donors = sorted((o for o in utils if count(o, pool_id) > target(o, pool_id)[0]),
+                        key=lambda o: (-utils[o], o))
+        recipients = sorted((o for o in utils if count(o, pool_id) < target(o, pool_id)[1]),
+                            key=lambda o: (utils[o], o))
+        moved = False
+        for from_osd in donors:
+            dests = [o for o in recipients if utils[from_osd] - utils[o] >= BYTE_BALANCE_MIN_GAP]
+            if not dests:
+                break       # donors are fullest first: the rest are even closer
+            if move_one(from_osd, dests, accept=accept_from(from_osd)):
+                moved = True
+                break
+        if not moved:
+            return
 
 def drain_to_at_ceil_osd(cluster_state, pool_id, valid_osds, bucket_map, logger):
     """Move one PG off an OSD whose target is 0 when no in-range move exists.

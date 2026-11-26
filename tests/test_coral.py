@@ -554,6 +554,47 @@ def pool_counts(state):
     return {o: state["osds"][o]["future_pgs_by_pool"].get(1, 0) for o in state["osds"]}
 
 
+class TestByteBalancing:
+    def test_extra_pg_goes_to_the_emptiest_osd(self, logger):
+        # OSD 0 has one PG too many; OSDs 1 and 2 both have room for it.
+        # OSD 1 is twice the size, so it's emptier in bytes and gets it.
+        state = make_state({0: (1, 1), 1: (0, 1), 2: (0, 1)},
+                           {"1.0": ([0], []), "1.1": ([0], [])})
+        state["osds"][1]["size"] = 20 * GiB
+        coral.balance_off_target_osds(state, logger)
+        assert pool_counts(state) == {0: 1, 1: 1, 2: 0}
+
+    def byte_state(self, used0, used1):
+        # Both OSDs in range (2 and 1 PGs, target 1-2); used is raw usage
+        state = make_state({0: (1, 2), 1: (1, 2)},
+                           {"1.0": ([0], []), "1.1": ([0], []), "1.2": ([1], [])})
+        state["osds"][0]["used"] = used0 * GiB
+        state["osds"][1]["used"] = used1 * GiB
+        return state
+
+    def test_moves_a_shard_from_a_fuller_to_an_emptier_osd(self, logger):
+        state = self.byte_state(5, 1)       # 50% vs 10%: 40% vs 20% after one move
+        coral.balance_off_target_osds(state, logger)
+        assert pool_counts(state) == {0: 1, 1: 2}
+
+    def test_leaves_small_differences_alone(self, logger):
+        state = self.byte_state(5.05, 5)    # 50.5% vs 50%: under BYTE_BALANCE_MIN_GAP
+        coral.balance_off_target_osds(state, logger)
+        assert pool_counts(state) == {0: 2, 1: 1}
+
+    def test_never_overshoots(self, logger):
+        state = self.byte_state(3, 2)       # 30% vs 20% would become 20% vs 30%
+        coral.balance_off_target_osds(state, logger)
+        assert pool_counts(state) == {0: 2, 1: 1}
+
+    def test_pool_shard_bytes(self):
+        state = make_state({0: (1, 1), 1: (1, 1)}, {"1.0": ([0, 1], []), "1.1": ([1, 0], [])})
+        state["pools"][2] = {"type": "erasure", "k": 4, "pgs": 2, "size": 6, "crush_rule": 0}
+        state["pgs"]["2.0"] = {"num_bytes": 8 * GiB}
+        state["pgs"]["2.1"] = {"num_bytes": 0}
+        assert coral.pool_shard_bytes(state) == {1: GiB, 2: GiB}
+
+
 class TestRebuildUpmaps:
     def test_recovers_crush_placement_through_chained_items(self, logger):
         # CRUSH gave [2, 1, 0]; (2 -> 3) then (1 -> 2) turned it into [3, 2, 0].
