@@ -59,3 +59,5 @@ OSD  | Class | Weight   | Size        | Current Usage              | Future Usag
 ```
 
 Usage percentage is color-coded: green (>0%), yellow (>80%), red (>90%), bright red (>100%).
+
+On a terminal the tables use box-drawing characters. When the output goes anywhere else (`watch`, a pipe, a file), they use plain ASCII (`+`, `-`, `|`) instead: some builds of procps `watch`, e.g. 3.3.17 without its UTF-8 support, drop every non-ASCII byte, which would erase the borders. `watch --color ./coral.py --preview` keeps the colors.

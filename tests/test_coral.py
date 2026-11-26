@@ -1,4 +1,5 @@
 import json
+import sys
 import re
 from unittest.mock import MagicMock
 import pytest
@@ -93,7 +94,7 @@ class TestGetOsdInfo:
         coral.calculate_usage(state, logger)
         coral.display_usage(state)
         coral.display_pgs_by_pool(state)
-        assert re.search(r"│\s*2\s*│", capsys.readouterr().out)    # osd.2's row in the usage table
+        assert re.search(r"\|\s*2\s*\|", capsys.readouterr().out)    # osd.2's row in the usage table
 
     def test_uses_given_pg_dump(self, mock_cluster, logger):
         pg_dump = {"pg_map": {"pg_stats": [], "osd_stats": [{"osd": 0, "kb": 7}, {"osd": 1, "kb": 7}]}}
@@ -1667,6 +1668,17 @@ class TestDisplayPgsByPool:
         out = self._strip_ansi(capsys.readouterr().out)
         assert "osd.0" not in out
 
+    def test_borders_are_ascii_unless_stdout_is_a_terminal(self, capsys, monkeypatch):
+        state = {"osds": {0: {"future_pgs_by_pool": {1: 0}, "target_pgs_by_pool": {1: (0, 1)}}},
+                 "pools": {1: {"name": "rbd"}}}
+        coral.display_pgs_by_pool(state)
+        out = capsys.readouterr().out
+        assert out.isascii() and "+-" in out and "|" in out
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+        coral.display_pgs_by_pool(state)
+        out = capsys.readouterr().out
+        assert "┌─" in out and "│" in out
+
     def test_table_lines_have_uniform_width(self, capsys):
         # Mix of short and long pool names exercises dynamic width sizing.
         long_name = "default.rgw.buckets.index"
@@ -1687,7 +1699,7 @@ class TestDisplayPgsByPool:
         out = self._strip_ansi(capsys.readouterr().out)
         # Every line that's part of a table (contains any box-drawing char)
         # should be the same visible length.
-        box_chars = set("┌┐└┘├┤┬┴┼│─")
+        box_chars = set("+|")    # ASCII borders: captured output isn't a terminal
         table_lines = [l for l in out.splitlines() if any(c in l for c in box_chars)]
         widths = {len(l) for l in table_lines}
         assert len(widths) == 1, f"table line widths differ: {widths}\n" + "\n".join(table_lines)

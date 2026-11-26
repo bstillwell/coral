@@ -74,6 +74,10 @@ crush_tree = mon_json(cluster, 'osd crush tree', shadow='--show-shadow')
 
 Dry-run mode (`print_upmap_plan()`) runs one `apply_upmap_round()` against the starting state with `is_dryrun=True`, which prints the equivalent `ceph` CLI commands instead of sending them, followed by a summary of the remaining PGs and shard moves.
 
+## Output
+
+The tables in `display_usage()` / `display_pgs_by_pool()` print through `print_table_line()`, which swaps the box-drawing characters for ASCII (`ASCII_BORDERS`) unless stdout is a terminal, so they survive `watch` builds that drop non-ASCII bytes. Keep other printed output ASCII too.
+
 ## Usage Calculation
 
 - **Replica pools**: each OSD in the acting set is credited the full `num_bytes` of the PG.

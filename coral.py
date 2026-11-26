@@ -20,6 +20,16 @@ RESET = '\033[0m'
 
 CRUSH_ITEM_NONE = 0x7fffffff
 
+# Box-drawing characters in the tables, and their plain-ASCII stand-ins
+ASCII_BORDERS = str.maketrans('┌┬┐├┼┤└┴┘─│', '+++++++++-|')
+
+def print_table_line(line=''):
+    """Print a line of a table. Unless stdout is a terminal, the borders are
+    plain ASCII: some programs that capture output, like procps watch built
+    without UTF-8 support, drop every non-ASCII byte, which erases the border
+    lines and the column separators."""
+    print(line if sys.stdout.isatty() else line.translate(ASCII_BORDERS))
+
 def main():
     parser = argparse.ArgumentParser(description="Coral (Clyso Optimized RebALancer)")
     parser.add_argument('--preview', action='store_true',
@@ -1865,7 +1875,7 @@ def display_usage(cluster_state):
         pad = max(0, group_width - visible)
         return ' ' * pad + ''.join(rendered)
 
-    print(border('┌', '┬', '┐'))
+    print_table_line(border('┌', '┬', '┐'))
     header = '│' + '│'.join([
         cell('OSD',           w_osd),
         cell('Class',         w_cls, 'left'),
@@ -1875,8 +1885,8 @@ def display_usage(cluster_state):
         cell('Future Usage',  w_fut, 'center'),
         cell('Change',        w_chg, 'center'),
     ]) + '│'
-    print(header)
-    print(border('├', '┼', '┤'))
+    print_table_line(header)
+    print_table_line(border('├', '┼', '┤'))
 
     for r in rows:
         cur_section = grouped_section([
@@ -1904,9 +1914,9 @@ def display_usage(cluster_state):
             ' ' + fut_section + ' ',
             ' ' + chg_section + ' ',
         ]) + '│'
-        print(line)
+        print_table_line(line)
 
-    print(border('└', '┴', '┘'))
+    print_table_line(border('└', '┴', '┘'))
 
 def display_pgs_by_pool(cluster_state):
     # For each OSD, print a small table showing the future PG count, target
@@ -1994,11 +2004,11 @@ def display_pgs_by_pool(cluster_state):
 
     for i, (osd_id, rows) in enumerate(sections):
         if i:
-            print()
-        print(f"{CYAN}osd.{osd_id}{RESET}")
-        print(top)
-        print(header)
-        print(middle)
+            print_table_line()
+        print_table_line(f"{CYAN}osd.{osd_id}{RESET}")
+        print_table_line(top)
+        print_table_line(header)
+        print_table_line(middle)
         for r in rows:
             line = '│' + '│'.join([
                 cell(r['pool'],       w_pool, 'left'),
@@ -2007,8 +2017,8 @@ def display_pgs_by_pool(cluster_state):
                 cell(r['ceil'],       w_ceil),
                 colored_cell(r['status'], w_status, r['color'], 'center'),
             ]) + '│'
-            print(line)
-        print(bottom)
+            print_table_line(line)
+        print_table_line(bottom)
 
 if __name__ == '__main__':
     main()
